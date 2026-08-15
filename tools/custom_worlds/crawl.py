@@ -121,6 +121,7 @@ class CrawlOptions:
     prune: bool = False
     install_mode: str = INSTALL_EXTRACT
     ignore_game_mismatch: bool = False
+    require_webworld: bool = False
     max_asset_bytes: int = DEFAULT_MAX_ASSET_BYTES
 
 
@@ -269,7 +270,7 @@ class Crawler:
         staged.parent.mkdir(parents=True, exist_ok=True)
         staged.write_bytes(payload)
 
-        result = verify_apworld(staged, self.versions)
+        result = verify_apworld(staged, self.versions, require_webworld=self.options.require_webworld)
         record.verification = result.status
         record.errors.extend(result.errors)
         record.warnings.extend(result.warnings)
@@ -528,6 +529,17 @@ def log_summary(records: Sequence[GameRecord]) -> None:
         for record in sorted(guessed, key=lambda item: item.title.lower()):
             logger.info("  %s -> %s", record.title, record.download_url)
 
+    webworld = [
+        record
+        for record in records
+        if record.succeeded and any("never sets 'web'" in warning for warning in record.warnings)
+    ]
+    if webworld:
+        logger.info("")
+        logger.info("Installed without a WebWorld, which breaks the WebHost tutorial page for the site:")
+        for record in sorted(webworld, key=lambda item: item.title.lower()):
+            logger.info("  %s (%s)", record.title, record.file or record.asset_name)
+
     shared = [record for record in records if record.succeeded and record.shared_repo and record.asset_name]
     if shared:
         logger.info("")
@@ -721,6 +733,12 @@ def build_parser() -> argparse.ArgumentParser:
         "'archive' drops the .apworld file in unchanged",
     )
     parser.add_argument(
+        "--require-webworld",
+        action="store_true",
+        help="refuse worlds that never set 'web'; they generate fine but break the WebHost "
+        "tutorial page for every game on the site",
+    )
+    parser.add_argument(
         "--ignore-game-mismatch",
         action="store_true",
         help="install an apworld even when its manifest names a different game than the wiki page; "
@@ -775,6 +793,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prune=args.prune,
         install_mode=args.install_mode,
         ignore_game_mismatch=args.ignore_game_mismatch,
+        require_webworld=args.require_webworld,
         max_asset_bytes=args.max_asset_bytes,
     )
 

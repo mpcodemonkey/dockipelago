@@ -201,6 +201,70 @@ class TestVerifyApworld(ApworldTestCase):
         self.assertTrue(any("lower case" in warning for warning in result.warnings))
 
 
+class TestWebWorldChecks(ApworldTestCase):
+    """The WebWorld analysis, reached through verify_apworld rather than directly."""
+
+    GOOD = (
+        "from worlds.AutoWorld import World, WebWorld\n"
+        "class MyGameWeb(WebWorld):\n    tutorials = []\n"
+        'class MyGameWorld(World):\n    game = "Test Game"\n    web = MyGameWeb()\n'
+    )
+    NOT_INSTANTIATED = GOOD.replace("web = MyGameWeb()", "web = MyGameWeb")
+    NO_WEB = (
+        "from worlds.AutoWorld import World\n"
+        'class MyGameWorld(World):\n    game = "Test Game"\n'
+    )
+
+    def test_correct_wiring_passes(self) -> None:
+        result = self.verify(manifest=default_manifest(), init_source=self.GOOD)
+        self.assertEqual(STATUS_OK, result.status, result.summary())
+
+    def test_an_uninstantiated_webworld_is_invalid(self) -> None:
+        result = self.verify(manifest=default_manifest(), init_source=self.NOT_INSTANTIATED)
+        self.assertEqual(STATUS_INVALID, result.status)
+        self.assertFalse(result.installable)
+        self.assertTrue(any("has to be instantiated" in error for error in result.errors), result.errors)
+
+    def test_a_missing_webworld_warns_by_default(self) -> None:
+        result = self.verify(manifest=default_manifest(), init_source=self.NO_WEB)
+        self.assertEqual(STATUS_WARNING, result.status)
+        self.assertTrue(result.installable)
+        self.assertTrue(any("never sets 'web'" in warning for warning in result.warnings), result.warnings)
+
+    def test_a_missing_webworld_can_be_made_fatal(self) -> None:
+        path = make_apworld(self.tmp / "mygame.apworld", manifest=default_manifest(), init_source=self.NO_WEB)
+        result = verify_apworld(path, VERSIONS, require_webworld=True)
+        self.assertEqual(STATUS_INVALID, result.status)
+        self.assertFalse(result.installable)
+
+    def test_require_webworld_does_not_disturb_a_correct_world(self) -> None:
+        path = make_apworld(self.tmp / "mygame.apworld", manifest=default_manifest(), init_source=self.GOOD)
+        self.assertEqual(STATUS_OK, verify_apworld(path, VERSIONS, require_webworld=True).status)
+
+    def test_unparseable_source_is_invalid(self) -> None:
+        result = self.verify(manifest=default_manifest(), init_source="class MyGameWorld(World)\n    pass\n")
+        self.assertEqual(STATUS_INVALID, result.status)
+        self.assertTrue(any("not valid Python" in error for error in result.errors), result.errors)
+
+    def test_a_world_defining_its_webworld_elsewhere_is_left_alone(self) -> None:
+        source = (
+            "from worlds.AutoWorld import World\n"
+            "from .web import MyGameWeb\n"
+            'class MyGameWorld(World):\n    game = "Test Game"\n    web = MyGameWeb()\n'
+        )
+        result = self.verify(manifest=default_manifest(), init_source=source)
+        self.assertEqual(STATUS_OK, result.status, result.summary())
+
+    def test_a_bytecode_only_world_is_not_analysed(self) -> None:
+        path = self.tmp / "mygame.apworld"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("mygame/__init__.pyc", b"\x00\x00")
+            archive.writestr("mygame/archipelago.json", json.dumps(default_manifest()))
+        result = verify_apworld(path, VERSIONS)
+        self.assertEqual(STATUS_WARNING, result.status)
+        self.assertTrue(any("bytecode" in warning for warning in result.warnings))
+
+
 class TestFindConflicts(unittest.TestCase):
     def _result(self, name: str, game: str | None) -> VerificationResult:
         from tools.custom_worlds.verify import Manifest

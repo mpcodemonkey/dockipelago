@@ -67,6 +67,7 @@ class CrawlTestCase(unittest.TestCase):
         module: str | None = None,
         manifest: dict[str, Any] | None = None,
         download_href: str | None = None,
+        init_source: str = "# test world\n",
     ) -> Path:
         href = download_href if download_href is not None else f"https://github.com/{repo}"
         self.pages[title] = {
@@ -80,6 +81,7 @@ class CrawlTestCase(unittest.TestCase):
             self.assets / asset_name,
             module=module if module is not None else Path(asset_name).stem,
             manifest=default_manifest(f"{title} Game") if manifest is None else manifest,
+            init_source=init_source,
         )
 
     def _serve_category(self, _url: str) -> dict[str, Any]:
@@ -623,6 +625,69 @@ class TestSharedRepository(CrawlTestCase):
         record = self.record_for(records, "Totally Different Title")
         self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
         self.assertTrue(any("declares game" in warning for warning in record.warnings), record.warnings)
+
+
+class TestWebWorldRejection(CrawlTestCase):
+    """Worlds whose WebWorld wiring would break Archipelago never reach worlds/."""
+
+    GOOD = (
+        "from worlds.AutoWorld import World, WebWorld\n"
+        "class MyGameWeb(WebWorld):\n    tutorials = []\n"
+        'class MyGameWorld(World):\n    game = "Some Game Game"\n    web = MyGameWeb()\n'
+    )
+    NOT_INSTANTIATED = GOOD.replace("web = MyGameWeb()", "web = MyGameWeb")
+    NO_WEB = (
+        "from worlds.AutoWorld import World\n"
+        'class MyGameWorld(World):\n    game = "Some Game Game"\n'
+    )
+
+    def test_a_correctly_wired_world_installs(self) -> None:
+        self.add_game("Some Game", init_source=self.GOOD)
+        records = self.crawl()
+        self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Some Game").outcome)
+        self.assert_installed("mygame")
+
+    def test_an_uninstantiated_webworld_is_not_installed(self) -> None:
+        self.add_game("Some Game", init_source=self.NOT_INSTANTIATED)
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("has to be instantiated", record.reason)
+        self.assert_not_installed("mygame")
+        self.assertEqual([], self.lock["worlds"])
+
+    def test_a_missing_webworld_installs_with_a_warning(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertTrue(any("never sets 'web'" in warning for warning in record.warnings), record.warnings)
+        self.assertEqual("warning", record.verification)
+        self.assert_installed("mygame")
+
+    def test_require_webworld_keeps_it_out(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        records = self.crawl(self.options(require_webworld=True))
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("never sets 'web'", record.reason)
+        self.assert_not_installed("mygame")
+
+    def test_the_warning_is_recorded_in_the_lockfile(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        self.crawl()
+        entry = self.lock["worlds"][0]
+        self.assertEqual("warning", entry["verification"])
+        self.assertTrue(any("never sets 'web'" in warning for warning in entry["warnings"]))
+
+    def test_one_broken_world_does_not_stop_the_others(self) -> None:
+        self.add_game("Good Game", repo="a/a", asset_name="good.apworld", init_source=self.GOOD)
+        self.add_game("Bad Game", repo="b/b", asset_name="bad.apworld", init_source=self.NOT_INSTANTIATED)
+        records = self.crawl()
+        self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Good Game").outcome)
+        self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Bad Game").outcome)
+        self.assert_installed("good")
+        self.assert_not_installed("bad")
 
 
 class TestArchiveMode(CrawlTestCase):

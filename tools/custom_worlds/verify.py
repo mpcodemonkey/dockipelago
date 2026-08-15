@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from .webworld import inspect_source
+
 logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "archipelago.json"
@@ -138,8 +140,13 @@ def parse_version(value: str) -> tuple[int, ...] | None:
         return None
 
 
-def verify_apworld(path: Path, versions: CoreVersions) -> VerificationResult:
-    """Check that ``path`` is an apworld this Archipelago checkout can load."""
+def verify_apworld(path: Path, versions: CoreVersions, *, require_webworld: bool = False) -> VerificationResult:
+    """Check that ``path`` is an apworld this Archipelago checkout can load.
+
+    ``require_webworld`` decides what to do about a world that never sets ``web``. Such a world does
+    load and generate, so it is a warning by default, but it breaks the WebHost's tutorial page for
+    the whole site - turn this on when the checkout exists to serve that site.
+    """
     result = VerificationResult(path=path)
 
     if path.suffix != ".apworld":
@@ -156,6 +163,7 @@ def verify_apworld(path: Path, versions: CoreVersions) -> VerificationResult:
                 result.fail(STATUS_INVALID, f"corrupt entry in archive: {corrupt}")
                 return result
             _check_layout(archive, path, result)
+            _check_webworld(archive, path, result, require_webworld=require_webworld)
             manifest_data = _read_manifest(archive, result)
     except zipfile.BadZipFile as error:
         result.fail(STATUS_INVALID, f"not a valid zip archive: {error}")
@@ -191,6 +199,34 @@ def _check_layout(archive: zipfile.ZipFile, path: Path, result: VerificationResu
         )
     else:
         result.fail(STATUS_INVALID, f"archive does not contain {expected}")
+
+
+def _check_webworld(
+    archive: zipfile.ZipFile,
+    path: Path,
+    result: VerificationResult,
+    *,
+    require_webworld: bool,
+) -> None:
+    """Read the world's ``__init__.py`` and report broken WebWorld wiring.
+
+    Only ``<stem>/__init__.py`` is looked at: a world that keeps its WebWorld in a separate module
+    cannot be judged from here, and :mod:`.webworld` stays quiet rather than guessing.
+    """
+    entry = f"{path.stem}/__init__.py"
+    try:
+        source = archive.read(entry).decode("utf-8", errors="replace")
+    except KeyError:
+        return  # _check_layout has already reported this
+    except (OSError, zipfile.BadZipFile) as error:
+        result.fail(STATUS_INVALID, f"could not read {entry}: {error}")
+        return
+
+    for finding in inspect_source(source, module_name=path.stem):
+        if finding.fatal or require_webworld:
+            result.fail(STATUS_INVALID, finding.detail)
+        else:
+            result.warn(finding.detail)
 
 
 def _read_manifest(archive: zipfile.ZipFile, result: VerificationResult) -> bytes | None:
