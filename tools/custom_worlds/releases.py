@@ -3,17 +3,24 @@
 Most custom worlds ship their apworld as a GitHub release asset, so the common path is
 "repository URL -> newest release -> ``*.apworld`` asset". A few pages link straight at a file, and
 that is handled too.
+
+The wrinkle is that a repository does not necessarily belong to one game. Maintainers who look after
+several worlds often publish all of them from a single repository, interleaved in one release feed,
+so "newest release with an .apworld in it" reliably fetches whichever game that maintainer touched
+most recently rather than the one the wiki page is about. Selection is therefore driven by
+:mod:`.matching` against the expected game name, and a repository known to publish several games
+yields nothing at all rather than a confident guess.
 """
 
 import logging
 import os
-import re
 import urllib.parse
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .http import HttpClient, HttpError
+from .matching import MIN_MATCH_SCORE, best_score, name_score, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +31,10 @@ GITHUB_API_VERSION = "2022-11-28"
 MAX_RELEASE_PAGES = 3
 RELEASES_PER_PAGE = 30
 
+#: How many runner-up assets to keep, for when the winner turns out to declare a different game.
+MAX_ALTERNATES = 4
+
 _GITHUB_HOSTS = frozenset({"github.com", "www.github.com"})
-_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
 class ResolutionError(Exception):
@@ -64,6 +73,34 @@ class ApworldAsset:
     def module_name(self) -> str:
         """The ``worlds.<name>`` module this file will be imported as."""
         return self.name[: -len(".apworld")] if self.name.endswith(".apworld") else self.name
+
+
+@dataclass(frozen=True)
+class AssetCandidate:
+    """One apworld found in the release feed, with how well it matches the game we want."""
+
+    asset: ApworldAsset
+    score: int
+    age: int  # 0 is the newest release; used only to break ties between equal scores
+
+    @property
+    def stem(self) -> str:
+        return self.asset.module_name
+
+
+@dataclass
+class Resolution:
+    """What a download link resolved to."""
+
+    selected: list[ApworldAsset] = field(default_factory=list)
+    #: Runner-up assets, best first, to fall back on if the winner declares a different game.
+    alternates: list[ApworldAsset] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    #: True when the repository publishes worlds for more than one game.
+    multi_game: bool = False
+    expected_game: str = ""
+    #: Set when nothing was selected, explaining why.
+    failure: str = ""
 
 
 class GitHubClient:
@@ -136,11 +173,11 @@ def resolve_assets(
     url: str,
     github: GitHubClient,
     *,
+    expected_game: str = "",
     allow_prerelease: bool = False,
     all_assets: bool = False,
-    hints: Sequence[str] = (),
-) -> tuple[list[ApworldAsset], list[str]]:
-    """Resolve ``url`` to the apworld asset(s) to download, plus notes about the choices made."""
+) -> Resolution:
+    """Resolve ``url`` to the apworld asset(s) to download for ``expected_game``."""
     # GitHub links are parsed first even when they end in .apworld, so a release asset link keeps
     # the repository and tag it came from instead of degrading to an anonymous file download.
     target = parse_github_url(url)
@@ -148,7 +185,10 @@ def resolve_assets(
         if url.lower().split("?")[0].endswith(".apworld"):
             name = urllib.parse.unquote(url.split("?", maxsplit=1)[0].rsplit("/", 1)[-1])
             host = urllib.parse.urlsplit(url).netloc
-            return [ApworldAsset(name=name, download_url=url, source=host)], ["linked directly at an .apworld file"]
+            return Resolution(
+                selected=[ApworldAsset(name=name, download_url=url, source=host)],
+                notes=["linked directly at an .apworld file"],
+            )
         raise ResolutionError(f"{url} is not a GitHub link and is not a direct .apworld download")
 
     if target.asset_url and target.asset_name:
@@ -158,7 +198,7 @@ def resolve_assets(
             source=target.slug,
             release_tag=target.tag or "",
         )
-        return [asset], ["linked directly at a release asset"]
+        return Resolution(selected=[asset], notes=["linked directly at a release asset"])
 
     notes: list[str] = []
     if target.tag:
@@ -171,28 +211,35 @@ def resolve_assets(
         if not releases:
             raise ResolutionError(f"{target.slug} has no GitHub releases")
 
-    assets, selection_notes = select_apworld_assets(
+    resolution = select_apworld_assets(
         releases,
+        expected_game=expected_game or target.repo,
         allow_prerelease=allow_prerelease,
         all_assets=all_assets,
-        hints=[*hints, target.repo],
         source=target.slug,
     )
-    notes.extend(selection_notes)
-    if not assets:
-        raise ResolutionError(f"no .apworld asset in the releases of {target.slug}")
-    return assets, notes
+    resolution.notes[:0] = notes
+    if not resolution.selected:
+        raise ResolutionError(resolution.failure or f"no .apworld asset in the releases of {target.slug}")
+    return resolution
 
 
 def select_apworld_assets(
     releases: Iterable[dict[str, Any]],
     *,
+    expected_game: str = "",
     allow_prerelease: bool = False,
     all_assets: bool = False,
-    hints: Sequence[str] = (),
     source: str = "",
-) -> tuple[list[ApworldAsset], list[str]]:
-    """Pick the apworld asset(s) from a repository's releases, newest usable release first."""
+) -> Resolution:
+    """Pick the apworld asset(s) a repository publishes for ``expected_game``.
+
+    A repository that only ever publishes one world is easy: take its newest release. A repository
+    that publishes several - one maintainer, several unrelated games - is the case this exists for.
+    There, every release is a candidate and the newest is usually the *wrong* game, so candidates
+    are ranked by how well their asset name, release tag and release title match the game the page
+    is about, and nothing is installed unless something actually matches.
+    """
     notes: list[str] = []
     usable = [release for release in releases if not release.get("draft")]
     usable.sort(key=_release_sort_key, reverse=True)
@@ -203,23 +250,62 @@ def select_apworld_assets(
         notes.append("only pre-releases available, using the newest one")
         ordered = usable
 
-    for release in ordered:
-        candidates = [
-            asset for asset in release.get("assets") or [] if str(asset.get("name", "")).lower().endswith(".apworld")
-        ]
-        if not candidates:
-            continue
+    candidates = _candidates(ordered, expected_game, source)
+    if not candidates:
+        return Resolution(notes=notes)
 
-        chosen = candidates if all_assets else [_best_asset(candidates, hints)]
-        skipped = [asset["name"] for asset in candidates if asset not in chosen]
-        if skipped:
-            notes.append(f"ignored other .apworld assets in the same release: {', '.join(sorted(skipped))}")
-        if release.get("prerelease"):
-            notes.append(f"release {release.get('tag_name', '')} is marked as a pre-release")
+    published_games = sorted({normalize(candidate.stem) for candidate in candidates})
+    multi_game = len(published_games) > 1
 
-        return [
-            ApworldAsset(
-                name=str(asset["name"]),
+    if multi_game:
+        winner = _pick_from_multi_game_repo(candidates, expected_game, source, published_games, notes)
+        if winner is None:
+            return Resolution(
+                notes=notes,
+                multi_game=True,
+                expected_game=expected_game,
+                failure=(
+                    f"{source or 'the repository'} publishes apworlds for several games "
+                    f"({', '.join(published_games)}) and none of them matches '{expected_game}'"
+                ),
+            )
+    else:
+        # One world, so the newest release of it is what we want regardless of what it is called.
+        winner = candidates[0]
+
+    selected = _assets_to_install(winner, candidates, all_assets=all_assets, notes=notes)
+    if winner.asset.prerelease:
+        notes.append(f"release {winner.asset.release_tag} is marked as a pre-release")
+
+    chosen_urls = {asset.download_url for asset in selected}
+    alternates = [
+        candidate.asset
+        for candidate in candidates
+        if candidate.asset.download_url not in chosen_urls and candidate.score > 0
+    ]
+    return Resolution(
+        selected=selected,
+        alternates=alternates[:MAX_ALTERNATES],
+        notes=notes,
+        multi_game=multi_game,
+        expected_game=expected_game,
+    )
+
+
+def _candidates(releases: Sequence[dict[str, Any]], expected_game: str, source: str) -> list[AssetCandidate]:
+    """Every .apworld across every release, scored against the expected game, best first.
+
+    Ties are broken towards the newer release, so an unscored repository still behaves like the old
+    "newest release wins" rule.
+    """
+    candidates: list[AssetCandidate] = []
+    for age, release in enumerate(releases):
+        for asset in release.get("assets") or []:
+            name = str(asset.get("name", ""))
+            if not name.lower().endswith(".apworld"):
+                continue
+            built = ApworldAsset(
+                name=name,
                 download_url=str(asset.get("browser_download_url", "")),
                 source=source,
                 size=asset.get("size"),
@@ -228,10 +314,71 @@ def select_apworld_assets(
                 published_at=str(release.get("published_at") or ""),
                 prerelease=bool(release.get("prerelease")),
             )
-            for asset in chosen
-        ], notes
+            candidates.append(AssetCandidate(asset=built, score=_score(expected_game, built), age=age))
 
-    return [], notes
+    candidates.sort(key=lambda candidate: (candidate.score, -candidate.age), reverse=True)
+    return candidates
+
+
+def _pick_from_multi_game_repo(
+    candidates: Sequence[AssetCandidate],
+    expected_game: str,
+    source: str,
+    published_games: Sequence[str],
+    notes: list[str],
+) -> "AssetCandidate | None":
+    """Choose the best-matching candidate, or nothing if the repository has no world for this game."""
+    matching = [candidate for candidate in candidates if candidate.score >= MIN_MATCH_SCORE]
+    if not matching:
+        return None
+
+    winner = matching[0]
+    notes.append(
+        f"{source or 'the repository'} publishes apworlds for {len(published_games)} games "
+        f"({', '.join(published_games)}); picked {winner.asset.name} from release "
+        f"{winner.asset.release_tag or '(untagged)'} as the match for '{expected_game}'"
+    )
+    return winner
+
+
+def _assets_to_install(
+    winner: AssetCandidate,
+    candidates: Sequence[AssetCandidate],
+    *,
+    all_assets: bool,
+    notes: list[str],
+) -> list[ApworldAsset]:
+    """The winning asset, or every apworld in the winning release under ``--all-assets``."""
+    others = sorted(
+        (
+            candidate.asset
+            for candidate in candidates
+            if candidate.asset.release_tag == winner.asset.release_tag
+            and candidate.asset.download_url != winner.asset.download_url
+        ),
+        key=lambda asset: asset.name,
+    )
+    if all_assets:
+        # The winner stays first: callers rely on it being the asset the game filter chose.
+        return [winner.asset, *others]
+
+    if others:
+        names = ", ".join(asset.name for asset in others)
+        notes.append(f"ignored other .apworld assets in the same release: {names}")
+    return [winner.asset]
+
+
+def _score(expected_game: str, asset: ApworldAsset) -> int:
+    """How strongly this asset looks like it belongs to ``expected_game``.
+
+    The file name is the most reliable signal, so a match on the release tag or title alone is
+    discounted - those often carry only a version number, or the maintainer's own naming scheme.
+    """
+    if not expected_game:
+        return 0
+    stem_score = name_score(expected_game, asset.module_name)
+    context_score = best_score(expected_game, asset.release_tag, asset.release_name)
+    return max(stem_score, int(context_score * 0.8))
 
 
 def _fetch_release_by_tag(github: GitHubClient, target: GitHubTarget, notes: list[str]) -> dict[str, Any]:
@@ -251,27 +398,3 @@ def _release_sort_key(release: dict[str, Any]) -> tuple[str, str]:
         str(release.get("published_at") or release.get("created_at") or ""),
         str(release.get("tag_name") or ""),
     )
-
-
-def _best_asset(assets: Sequence[dict[str, Any]], hints: Sequence[str]) -> dict[str, Any]:
-    """Prefer the asset whose name looks like the repository or page it came from."""
-    normalized_hints = [_normalize(hint) for hint in hints if hint]
-
-    def score(asset: dict[str, Any]) -> tuple[int, int]:
-        stem = _normalize(str(asset.get("name", "")).removesuffix(".apworld"))
-        best = 0
-        for hint in normalized_hints:
-            if not stem or not hint:
-                continue
-            if stem == hint:
-                best = max(best, 3)
-            elif stem in hint or hint in stem:
-                best = max(best, 2)
-        # Shorter names win ties: "game.apworld" over "game_debug_build.apworld".
-        return best, -len(str(asset.get("name", "")))
-
-    return max(assets, key=score)
-
-
-def _normalize(value: str) -> str:
-    return _NON_ALNUM.sub("", value.lower())

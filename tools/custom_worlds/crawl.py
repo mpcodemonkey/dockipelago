@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from .http import HttpClient, HttpError
-from .releases import ApworldAsset, GitHubClient, ResolutionError, resolve_assets
+from .matching import matches
+from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
 from .verify import (
     STATUS_OK,
     CoreVersions,
@@ -36,7 +37,15 @@ from .verify import (
     find_conflicts,
     verify_apworld,
 )
-from .wiki import DEFAULT_API_URL, DEFAULT_CATEGORY, DownloadCandidate, WikiApiError, WikiClient, extract_download_url
+from .wiki import (
+    DEFAULT_API_URL,
+    DEFAULT_CATEGORY,
+    DownloadCandidate,
+    WikiApiError,
+    WikiClient,
+    extract_download_url,
+    extract_game_name,
+)
 
 logger = logging.getLogger("custom_worlds")
 
@@ -67,6 +76,10 @@ class GameRecord:
 
     title: str
     page_url: str = ""
+    #: The game the page is about, which is not always the article title.
+    expected_game: str = ""
+    #: True when the source repository publishes worlds for more than one game.
+    shared_repo: bool = False
     outcome: str = OUTCOME_FAILED
     reason: str = ""
     download_url: str = ""
@@ -107,6 +120,7 @@ class CrawlOptions:
     dry_run: bool = False
     prune: bool = False
     install_mode: str = INSTALL_EXTRACT
+    ignore_game_mismatch: bool = False
     max_asset_bytes: int = DEFAULT_MAX_ASSET_BYTES
 
 
@@ -137,14 +151,16 @@ class Crawler:
             record = GameRecord(title=title, page_url=self.wiki.page_url(title))
             self.records.append(record)
 
-            assets = self._resolve(title, record)
+            resolution = self._resolve(title, record)
             # A release may ship several worlds under --all-assets; each gets its own record, the
             # first reusing the page's record so the common one-world case reads unchanged.
-            for position, asset in enumerate(assets):
+            for position, asset in enumerate(resolution.selected):
                 asset_record = record if position == 0 else _sibling_record(record)
                 if position > 0:
                     self.records.append(asset_record)
-                result = self._fetch(asset, asset_record, staging)
+                # Only the primary asset is checked against the expected game: anything after it
+                # is there because --all-assets asked for everything in the release.
+                result = self._fetch(asset, asset_record, staging, resolution, confirm_game=position == 0)
                 if result is not None:
                     verified[result.path] = (asset_record, result)
 
@@ -165,31 +181,61 @@ class Crawler:
             titles = titles[: self.options.limit]
         return titles
 
-    def _resolve(self, title: str, record: GameRecord) -> list[ApworldAsset]:
+    def _resolve(self, title: str, record: GameRecord) -> Resolution:
         """Find the page's download link and turn it into the asset(s) to fetch."""
         candidate = self._find_link(title, record)
         if candidate is None:
-            return []
+            return Resolution()
 
         try:
-            assets, notes = resolve_assets(
+            resolution = resolve_assets(
                 candidate.url,
                 self.github,
+                expected_game=record.expected_game or title,
                 allow_prerelease=self.options.allow_prerelease,
                 all_assets=self.options.all_assets,
-                hints=[title],
             )
         except (ResolutionError, HttpError) as error:
             record.outcome = OUTCOME_FAILED
             record.reason = str(error)
             logger.warning("  no apworld: %s", error)
-            return []
+            return Resolution()
 
-        record.notes.extend(notes)
-        return assets
+        record.shared_repo = resolution.multi_game
+        record.notes.extend(resolution.notes)
+        for note in resolution.notes:
+            logger.info("  %s", note)
+        return resolution
 
-    def _fetch(self, asset: ApworldAsset, record: GameRecord, staging: Path) -> VerificationResult | None:
-        """Download and verify one asset, returning its result if it is fit to install."""
+    def _fetch(
+        self,
+        asset: ApworldAsset,
+        record: GameRecord,
+        staging: Path,
+        resolution: Resolution,
+        *,
+        confirm_game: bool = True,
+    ) -> VerificationResult | None:
+        """Download and verify an asset, moving on to a runner-up if it turns out to be another game.
+
+        The manifest is the only place a world states which game it implements, and it is not
+        readable until the file has been fetched. So when a repository publishes several games, a
+        name-based pick is treated as provisional and confirmed against the manifest here.
+        """
+        queue = [asset, *resolution.alternates] if resolution.multi_game and confirm_game else [asset]
+        for attempt, current in enumerate(queue):
+            result = self._download_and_verify(current, record, staging)
+            if result is None:
+                return None
+            if not confirm_game:
+                return result
+            if self._game_is_right(current, record, result, resolution, has_fallback=attempt < len(queue) - 1):
+                return result
+        return None
+
+    def _download_and_verify(
+        self, asset: ApworldAsset, record: GameRecord, staging: Path
+    ) -> VerificationResult | None:
         record.repo = asset.source
         record.release_tag = asset.release_tag
         record.asset_name = asset.name
@@ -250,6 +296,39 @@ class Crawler:
         )
         return result
 
+    def _game_is_right(
+        self,
+        asset: ApworldAsset,
+        record: GameRecord,
+        result: VerificationResult,
+        resolution: Resolution,
+        *,
+        has_fallback: bool,
+    ) -> bool:
+        """Confirm the downloaded world implements the game the page is about."""
+        expected = record.expected_game or record.title
+        if self.options.ignore_game_mismatch or not result.game or not expected:
+            return True
+        if matches(expected, result.game):
+            return True
+
+        detail = f"{asset.name} declares game '{result.game}', but the page is about '{expected}'"
+        if not resolution.multi_game:
+            # One world in the repository, so this is naming drift rather than the wrong game.
+            record.warnings.append(detail)
+            logger.info("  note: %s", detail)
+            return True
+
+        record.notes.append(f"rejected {detail}")
+        logger.warning("  wrong game: %s", detail)
+        if not has_fallback:
+            record.outcome = OUTCOME_FAILED
+            record.reason = (
+                f"{asset.source} publishes apworlds for several games and none of them declares "
+                f"'{expected}'; last tried {asset.name}, which is '{result.game}'"
+            )
+        return False
+
     def _find_link(self, title: str, record: GameRecord) -> DownloadCandidate | None:
         try:
             page = self.wiki.fetch_page(title)
@@ -260,6 +339,7 @@ class Crawler:
             return None
 
         record.page_url = page.url
+        record.expected_game = extract_game_name(page)
         candidate = extract_download_url(page)
         if candidate is None:
             record.outcome = OUTCOME_FAILED
@@ -387,12 +467,14 @@ def write_lockfile(path: Path, records: Sequence[GameRecord], options: CrawlOpti
         {
             "title": record.title,
             "page_url": record.page_url,
+            "expected_game": record.expected_game,
             "game": record.game,
             "repo": record.repo,
             "release_tag": record.release_tag,
             "asset_name": record.asset_name,
             "download_url": record.download_url,
             "file": record.file,
+            "shared_repo": record.shared_repo,
             "install_mode": options.install_mode,
             "sha256": record.sha256,
             "size": record.size,
@@ -445,6 +527,19 @@ def log_summary(records: Sequence[GameRecord]) -> None:
         logger.info("Download link was guessed rather than read from the infobox (worth spot checking):")
         for record in sorted(guessed, key=lambda item: item.title.lower()):
             logger.info("  %s -> %s", record.title, record.download_url)
+
+    shared = [record for record in records if record.succeeded and record.shared_repo and record.asset_name]
+    if shared:
+        logger.info("")
+        logger.info("Picked out of a repository that publishes several games (worth spot checking):")
+        for record in sorted(shared, key=lambda item: item.title.lower()):
+            logger.info(
+                "  %-30s %s -> %s (%s)",
+                record.title,
+                record.repo,
+                record.asset_name,
+                record.game or "no game in manifest",
+            )
 
 
 def run_import_check(root: Path, python: str = sys.executable) -> tuple[bool, str]:
@@ -558,6 +653,8 @@ def _sibling_record(record: GameRecord) -> GameRecord:
     return GameRecord(
         title=record.title,
         page_url=record.page_url,
+        expected_game=record.expected_game,
+        shared_repo=record.shared_repo,
         download_url=record.download_url,
         strategy=record.strategy,
         confidence=record.confidence,
@@ -623,6 +720,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="'extract' unpacks each apworld into worlds/<name>/ so git can diff it; "
         "'archive' drops the .apworld file in unchanged",
     )
+    parser.add_argument(
+        "--ignore-game-mismatch",
+        action="store_true",
+        help="install an apworld even when its manifest names a different game than the wiki page; "
+        "only useful if the game filter misfires on an unusually named world",
+    )
     parser.add_argument("--refresh", action="store_true", help="re-download even when the lockfile says nothing moved")
     parser.add_argument(
         "--prune",
@@ -671,6 +774,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=args.dry_run,
         prune=args.prune,
         install_mode=args.install_mode,
+        ignore_game_mismatch=args.ignore_game_mismatch,
         max_asset_bytes=args.max_asset_bytes,
     )
 

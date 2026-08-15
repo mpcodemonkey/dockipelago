@@ -7,6 +7,7 @@ from tools.custom_worlds.wiki import (
     WikiClient,
     WikiPage,
     extract_download_url,
+    extract_game_name,
     parse_templates,
 )
 
@@ -81,6 +82,37 @@ class TestExtractFromWikitext(unittest.TestCase):
         candidate = extract_download_url(page)
         assert candidate is not None
         self.assertEqual("medium", candidate.confidence)
+
+
+class TestExtractGameName(unittest.TestCase):
+    def _page(self, title: str, wikitext: str = "") -> WikiPage:
+        return WikiPage(title=title, url="https://wiki.test/x", wikitext=wikitext)
+
+    def test_prefers_the_infobox_game_parameter(self) -> None:
+        page = self._page("ActRaiser (SNES)", "{{Infobox game| game = ActRaiser | developer = Quintet }}")
+        self.assertEqual("ActRaiser", extract_game_name(page))
+
+    def test_falls_back_to_the_infobox_title(self) -> None:
+        page = self._page("Some Article", "{{Infobox game| title = Sonic Battle }}")
+        self.assertEqual("Sonic Battle", extract_game_name(page))
+
+    def test_ignores_parameters_holding_markup_or_links(self) -> None:
+        page = self._page("Rune Factory", "{{Infobox game| title = [[Rune Factory]] }}")
+        self.assertEqual("Rune Factory", extract_game_name(page))
+
+    def test_ignores_parameters_holding_a_url(self) -> None:
+        page = self._page("Rune Factory", "{{Infobox game| name = https://example.test/rf }}")
+        self.assertEqual("Rune Factory", extract_game_name(page))
+
+    def test_falls_back_to_the_page_title(self) -> None:
+        self.assertEqual("ActRaiser", extract_game_name(self._page("ActRaiser")))
+
+    def test_strips_a_disambiguation_suffix(self) -> None:
+        self.assertEqual("Adventure", extract_game_name(self._page("Adventure (Atari 2600)")))
+
+    def test_a_non_infobox_template_is_not_consulted(self) -> None:
+        page = self._page("ActRaiser", "{{Navbox| game = Something Else }}")
+        self.assertEqual("ActRaiser", extract_game_name(page))
 
 
 class TestExtractFromHtml(unittest.TestCase):

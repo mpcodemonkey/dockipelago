@@ -1,6 +1,7 @@
 """Tests for turning a download link into a concrete apworld asset."""
 
 import unittest
+from typing import Any
 
 from test.custom_worlds.helpers import FakeHttp, release
 from tools.custom_worlds.releases import (
@@ -65,7 +66,7 @@ class TestSelectApworldAssets(unittest.TestCase):
             release("v2", "notes.txt", published_at="2026-02-01T00:00:00Z"),
             release("v1", "game.apworld", published_at="2026-01-01T00:00:00Z"),
         ]
-        assets, _notes = select_apworld_assets(releases)
+        assets, _notes = _select(releases)
         self.assertEqual(["game.apworld"], [asset.name for asset in assets])
         self.assertEqual("v1", assets[0].release_tag)
 
@@ -74,7 +75,7 @@ class TestSelectApworldAssets(unittest.TestCase):
             release("old", "game.apworld", published_at="2025-01-01T00:00:00Z"),
             release("new", "game.apworld", published_at="2026-01-01T00:00:00Z"),
         ]
-        assets, _notes = select_apworld_assets(releases)
+        assets, _notes = _select(releases)
         self.assertEqual("new", assets[0].release_tag)
 
     def test_drafts_are_never_used(self) -> None:
@@ -82,7 +83,7 @@ class TestSelectApworldAssets(unittest.TestCase):
             release("draft", "game.apworld", published_at="2026-05-01T00:00:00Z", draft=True),
             release("v1", "game.apworld", published_at="2026-01-01T00:00:00Z"),
         ]
-        assets, _notes = select_apworld_assets(releases)
+        assets, _notes = _select(releases)
         self.assertEqual("v1", assets[0].release_tag)
 
     def test_prereleases_are_skipped_by_default(self) -> None:
@@ -90,7 +91,7 @@ class TestSelectApworldAssets(unittest.TestCase):
             release("v2-rc1", "game.apworld", published_at="2026-05-01T00:00:00Z", prerelease=True),
             release("v1", "game.apworld", published_at="2026-01-01T00:00:00Z"),
         ]
-        assets, _notes = select_apworld_assets(releases)
+        assets, _notes = _select(releases)
         self.assertEqual("v1", assets[0].release_tag)
 
     def test_prereleases_can_be_opted_into(self) -> None:
@@ -98,33 +99,33 @@ class TestSelectApworldAssets(unittest.TestCase):
             release("v2-rc1", "game.apworld", published_at="2026-05-01T00:00:00Z", prerelease=True),
             release("v1", "game.apworld", published_at="2026-01-01T00:00:00Z"),
         ]
-        assets, notes = select_apworld_assets(releases, allow_prerelease=True)
+        assets, notes = _select(releases, allow_prerelease=True)
         self.assertEqual("v2-rc1", assets[0].release_tag)
         self.assertTrue(any("pre-release" in note for note in notes))
 
     def test_a_prerelease_only_repository_still_resolves(self) -> None:
         releases = [release("v0.1-beta", "game.apworld", prerelease=True)]
-        assets, notes = select_apworld_assets(releases)
+        assets, notes = _select(releases)
         self.assertEqual("v0.1-beta", assets[0].release_tag)
         self.assertTrue(any("only pre-releases" in note for note in notes))
 
     def test_picks_the_asset_matching_the_repository_name(self) -> None:
         releases = [release("v1", "some_other_tool.apworld", "my_game.apworld")]
-        assets, notes = select_apworld_assets(releases, hints=["My Game", "my_game"])
+        assets, notes = _select(releases, expected_game="My Game")
         self.assertEqual(["my_game.apworld"], [asset.name for asset in assets])
         self.assertTrue(any("ignored other .apworld assets" in note for note in notes))
 
     def test_all_assets_keeps_every_apworld(self) -> None:
         releases = [release("v1", "a.apworld", "b.apworld")]
-        assets, _notes = select_apworld_assets(releases, all_assets=True, hints=["a"])
+        assets, _notes = _select(releases, all_assets=True, expected_game="a")
         self.assertEqual({"a.apworld", "b.apworld"}, {asset.name for asset in assets})
 
     def test_returns_nothing_when_no_release_has_an_apworld(self) -> None:
-        assets, _notes = select_apworld_assets([release("v1", "setup.exe")])
+        assets, _notes = _select([release("v1", "setup.exe")])
         self.assertEqual([], assets)
 
     def test_asset_metadata_is_carried_through(self) -> None:
-        assets, _notes = select_apworld_assets([release("v1", "game.apworld")], source="owner/repo")
+        assets, _notes = _select([release("v1", "game.apworld")], source="owner/repo")
         asset = assets[0]
         self.assertEqual("owner/repo", asset.source)
         self.assertEqual(1024, asset.size)
@@ -141,13 +142,13 @@ class TestResolveAssets(unittest.TestCase):
     def test_resolves_a_repository_link_through_the_releases_api(self) -> None:
         http = FakeHttp()
         http.json_route("/repos/owner/repo/releases", [release("v1", "game.apworld")])
-        assets, _notes = resolve_assets("https://github.com/owner/repo", self._github(http))
+        assets, _notes = _resolve("https://github.com/owner/repo", self._github(http))
         self.assertEqual("game.apworld", assets[0].name)
         self.assertEqual("owner/repo", assets[0].source)
 
     def test_a_direct_apworld_url_needs_no_api_call(self) -> None:
         http = FakeHttp()
-        assets, notes = resolve_assets("https://example.test/files/My%20Game.apworld", self._github(http))
+        assets, notes = _resolve("https://example.test/files/My%20Game.apworld", self._github(http))
         self.assertEqual("My Game.apworld", assets[0].name)
         self.assertEqual([], http.requests)
         self.assertTrue(any("directly at an .apworld" in note for note in notes))
@@ -155,7 +156,7 @@ class TestResolveAssets(unittest.TestCase):
     def test_a_release_asset_link_is_used_as_is(self) -> None:
         http = FakeHttp()
         url = "https://github.com/owner/repo/releases/download/v3/game.apworld"
-        assets, _notes = resolve_assets(url, self._github(http))
+        assets, _notes = _resolve(url, self._github(http))
         self.assertEqual(url, assets[0].download_url)
         self.assertEqual("v3", assets[0].release_tag)
         self.assertEqual([], http.requests)
@@ -163,14 +164,14 @@ class TestResolveAssets(unittest.TestCase):
     def test_a_tagged_link_reads_that_specific_release(self) -> None:
         http = FakeHttp()
         http.json_route("/releases/tags/v9", release("v9", "game.apworld"))
-        assets, _notes = resolve_assets("https://github.com/owner/repo/releases/tag/v9", self._github(http))
+        assets, _notes = _resolve("https://github.com/owner/repo/releases/tag/v9", self._github(http))
         self.assertEqual("v9", assets[0].release_tag)
 
     def test_a_missing_tag_falls_back_to_the_newest_release(self) -> None:
         http = FakeHttp()
         http.route("/releases/tags/", lambda url: (_ for _ in ()).throw(_not_found(url)))
         http.json_route("/repos/owner/repo/releases", [release("v2", "game.apworld")])
-        assets, notes = resolve_assets("https://github.com/owner/repo/releases/tag/gone", self._github(http))
+        assets, notes = _resolve("https://github.com/owner/repo/releases/tag/gone", self._github(http))
         self.assertEqual("v2", assets[0].release_tag)
         self.assertTrue(any("falling back" in note for note in notes))
 
@@ -216,6 +217,17 @@ class TestGitHubClient(unittest.TestCase):
         client = GitHubClient(FakeHttp(), token=None)  # type: ignore[arg-type]
         client.token = None
         self.assertNotIn("Authorization", client.headers)
+
+
+def _select(*args: Any, **kwargs: Any) -> tuple[list[Any], list[str]]:
+    """select_apworld_assets returns a Resolution; these tests only care about two of its fields."""
+    resolution = select_apworld_assets(*args, **kwargs)
+    return resolution.selected, resolution.notes
+
+
+def _resolve(*args: Any, **kwargs: Any) -> tuple[list[Any], list[str]]:
+    resolution = resolve_assets(*args, **kwargs)
+    return resolution.selected, resolution.notes
 
 
 def _not_found(url: str) -> Exception:

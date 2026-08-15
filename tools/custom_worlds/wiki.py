@@ -195,6 +195,30 @@ class WikiClient:
         return payload
 
 
+#: Infobox parameters that name the game, checked before falling back to the page title.
+GAME_NAME_PARAMS: tuple[str, ...] = ("game", "game_name", "title", "name")
+
+_DISAMBIGUATION_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def extract_game_name(page: WikiPage) -> str:
+    """The name of the game this page is about.
+
+    Used to tell one maintainer's games apart when they share a repository, so it wants to be the
+    game's real name rather than the article's. The infobox usually carries it verbatim; the page
+    title is the fallback, minus any ``(disambiguation)`` suffix the wiki added to make it unique.
+    """
+    for template in parse_templates(page.wikitext):
+        if "infobox" not in template.name.lower():
+            continue
+        for param in GAME_NAME_PARAMS:
+            value = template.params.get(param, "").strip()
+            # Skip values that are wiki markup or a link rather than a plain name.
+            if value and not value.startswith(("[", "{", "<")) and "://" not in value:
+                return value
+    return _DISAMBIGUATION_RE.sub("", page.title).strip() or page.title
+
+
 def extract_download_url(page: WikiPage) -> DownloadCandidate | None:
     """Find the most plausible apworld download link on ``page``."""
     for finder in (_from_infobox_params, _from_rendered_html, _from_external_links):

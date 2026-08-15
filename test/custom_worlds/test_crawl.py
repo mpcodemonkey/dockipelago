@@ -99,11 +99,13 @@ class CrawlTestCase(unittest.TestCase):
         return []
 
     def _serve_asset(self, url: str) -> bytes:
-        name = url.rsplit("/", 1)[-1]
-        path = self.assets / name
-        if not path.is_file():
-            raise AssertionError(f"no fixture asset for {url}")
-        return path.read_bytes()
+        # .../releases/download/<tag>/<name>. A "<tag>__<name>" fixture lets two releases serve
+        # different bytes under the same asset name.
+        *_, tag, name = url.split("/")
+        for candidate in (self.assets / f"{tag}__{name}", self.assets / name):
+            if candidate.is_file():
+                return candidate.read_bytes()
+        raise AssertionError(f"no fixture asset for {url}")
 
     # -- running -----------------------------------------------------------------------
 
@@ -424,39 +426,50 @@ class TestOptions(CrawlTestCase):
 
 
 class TestMultipleAssets(CrawlTestCase):
-    """A single release that ships more than one world."""
+    """A single release that ships more than one world for the same page."""
 
     def setUp(self) -> None:
         super().setUp()
-        href = "https://github.com/owner/repo"
+        href = "https://github.com/owner/bundle_game"
         self.pages["Bundle Game"] = {
             "title": "Bundle Game",
-            "wikitext": f"{{{{Infobox game| download = [{href} Download] }}}}",
+            "wikitext": f"{{{{Infobox game| game = Bundle Game | download = [{href} Download] }}}}",
             "text": wiki_page_html(title="Bundle Game", download_href=href),
             "externallinks": [href],
         }
-        self.releases["owner/repo"] = [release("v1.0.0", "first.apworld", "second.apworld")]
-        make_apworld(self.assets / "first.apworld", module="first", manifest=default_manifest("First Game"))
-        make_apworld(self.assets / "second.apworld", module="second", manifest=default_manifest("Second Game"))
+        self.releases["owner/bundle_game"] = [
+            release("v1.0.0", "bundle_game.apworld", "bundle_game_extras.apworld", repo="owner/bundle_game")
+        ]
+        make_apworld(
+            self.assets / "bundle_game.apworld", module="bundle_game", manifest=default_manifest("Bundle Game")
+        )
+        make_apworld(
+            self.assets / "bundle_game_extras.apworld",
+            module="bundle_game_extras",
+            manifest=default_manifest("Bundle Game Extras"),
+        )
 
     def test_only_the_best_match_is_installed_by_default(self) -> None:
         records = self.crawl()
         self.assertEqual(1, len(records))
+        self.assert_installed("bundle_game")
+        self.assert_not_installed("bundle_game_extras")
         self.assertEqual(1, len(self.lock["worlds"]))
 
-    def test_all_assets_installs_every_world(self) -> None:
+    def test_all_assets_installs_every_world_in_the_release(self) -> None:
         records = self.crawl(self.options(all_assets=True))
         self.assertEqual(2, len(records))
         self.assertTrue(all(record.outcome == OUTCOME_INSTALLED for record in records), records)
-        self.assert_installed("first")
-        self.assert_installed("second")
-        self.assertEqual({"First Game", "Second Game"}, {entry["game"] for entry in self.lock["worlds"]})
+        self.assert_installed("bundle_game")
+        self.assert_installed("bundle_game_extras")
 
     def test_each_asset_gets_its_own_lockfile_entry(self) -> None:
         self.crawl(self.options(all_assets=True))
         entries = self.lock["worlds"]
         self.assertEqual(["Bundle Game", "Bundle Game"], [entry["title"] for entry in entries])
-        self.assertEqual({"first.apworld", "second.apworld"}, {entry["asset_name"] for entry in entries})
+        self.assertEqual(
+            {"bundle_game.apworld", "bundle_game_extras.apworld"}, {entry["asset_name"] for entry in entries}
+        )
 
     def test_a_second_run_leaves_both_alone(self) -> None:
         self.crawl(self.options(all_assets=True))
@@ -466,7 +479,150 @@ class TestMultipleAssets(CrawlTestCase):
     def test_extra_assets_inherit_the_pages_link_provenance(self) -> None:
         records = self.crawl(self.options(all_assets=True, dry_run=True))
         self.assertEqual({"infobox-param"}, {record.strategy for record in records})
-        self.assertEqual({"https://github.com/owner/repo"}, {record.download_url for record in records})
+        self.assertEqual({"https://github.com/owner/bundle_game"}, {record.download_url for record in records})
+
+
+class TestSharedRepository(CrawlTestCase):
+    """One maintainer publishing several unrelated games out of a single repository.
+
+    Modelled on the real case: an ActRaiser page pointing at a repository whose release feed also
+    carries Sonic Battle and Rune Factory, with those two released more recently.
+    """
+
+    REPO = "maintainer/apworlds"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.releases[self.REPO] = [
+            release("runefactory-2.0.0", "runefactory.apworld", published_at="2026-06-01T00:00:00Z", repo=self.REPO),
+            release("sonicbattle-1.4.0", "sonic_battle.apworld", published_at="2026-05-01T00:00:00Z", repo=self.REPO),
+            release("actraiser-1.1.0", "actraiser.apworld", published_at="2026-01-01T00:00:00Z", repo=self.REPO),
+        ]
+        for stem, game in (
+            ("runefactory", "Rune Factory"),
+            ("sonic_battle", "Sonic Battle"),
+            ("actraiser", "ActRaiser"),
+        ):
+            make_apworld(self.assets / f"{stem}.apworld", module=stem, manifest=default_manifest(game))
+
+    def add_page(self, title: str) -> None:
+        href = f"https://github.com/{self.REPO}"
+        self.pages[title] = {
+            "title": title,
+            "wikitext": f"{{{{Infobox game| game = {title} | download = [{href} Download] }}}}",
+            "text": wiki_page_html(title=title, download_href=href),
+            "externallinks": [href],
+        }
+
+    def test_picks_the_game_the_page_is_about_not_the_newest_release(self) -> None:
+        self.add_page("ActRaiser")
+        records = self.crawl()
+        record = self.record_for(records, "ActRaiser")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertEqual("actraiser.apworld", record.asset_name)
+        self.assertEqual("actraiser-1.1.0", record.release_tag)
+        self.assertEqual("ActRaiser", record.game)
+        self.assert_installed("actraiser")
+        self.assert_not_installed("runefactory")
+        self.assert_not_installed("sonic_battle")
+
+    def test_each_page_gets_its_own_game(self) -> None:
+        for title in ("ActRaiser", "Sonic Battle", "Rune Factory"):
+            self.add_page(title)
+        records = self.crawl()
+        installed = {record.title: record.game for record in records}
+        self.assertEqual({"ActRaiser": "ActRaiser", "Sonic Battle": "Sonic Battle", "Rune Factory": "Rune Factory"},
+                         installed)
+
+    def test_the_lockfile_flags_worlds_from_a_shared_repository(self) -> None:
+        self.add_page("ActRaiser")
+        self.crawl()
+        self.assertTrue(self.lock["worlds"][0]["shared_repo"])
+
+    def test_the_note_explains_the_choice(self) -> None:
+        self.add_page("Sonic Battle")
+        records = self.crawl()
+        record = self.record_for(records, "Sonic Battle")
+        self.assertTrue(
+            any("publishes apworlds for 3 games" in note for note in record.notes), record.notes
+        )
+
+    def test_a_game_the_repository_does_not_publish_is_refused(self) -> None:
+        self.add_page("Chrono Trigger")
+        records = self.crawl()
+        record = self.record_for(records, "Chrono Trigger")
+        self.assertEqual(OUTCOME_FAILED, record.outcome)
+        self.assertIn("none of them matches", record.reason)
+        self.assertEqual([], self.lock["worlds"])
+
+    def test_nothing_is_installed_when_no_game_matches(self) -> None:
+        self.add_page("Chrono Trigger")
+        self.crawl()
+        for stem in ("actraiser", "runefactory", "sonic_battle"):
+            self.assert_not_installed(stem)
+
+    def add_mislabelled_release(self) -> None:
+        """A newer release whose asset is named actraiser.apworld but contains Rune Factory.
+
+        The file name alone cannot distinguish it from the genuine article, so only the manifest
+        inside the downloaded file gives the game away.
+        """
+        self.releases[self.REPO].insert(
+            0,
+            release("bad-3.0.0", "actraiser.apworld", published_at="2026-07-01T00:00:00Z", repo=self.REPO),
+        )
+        make_apworld(
+            self.assets / "bad-3.0.0__actraiser.apworld",
+            module="actraiser",
+            manifest=default_manifest("Rune Factory"),
+        )
+
+    def test_a_misleading_file_name_is_caught_by_the_manifest(self) -> None:
+        self.add_page("ActRaiser")
+        self.add_mislabelled_release()
+        records = self.crawl()
+        record = self.record_for(records, "ActRaiser")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertEqual("actraiser-1.1.0", record.release_tag)
+        self.assertEqual("ActRaiser", record.game)
+        self.assertTrue(any("rejected" in note for note in record.notes), record.notes)
+
+    def test_giving_up_after_exhausting_the_alternates_is_reported(self) -> None:
+        self.add_page("ActRaiser")
+        self.add_mislabelled_release()
+        # Now the genuine release lies about its game too, so nothing in the repository qualifies.
+        make_apworld(
+            self.assets / "actraiser.apworld", module="actraiser", manifest=default_manifest("Sonic Battle")
+        )
+        records = self.crawl()
+        record = self.record_for(records, "ActRaiser")
+        self.assertEqual(OUTCOME_FAILED, record.outcome)
+        self.assertIn("none of them declares", record.reason)
+        self.assert_not_installed("actraiser")
+
+    def test_ignore_game_mismatch_takes_the_name_based_pick(self) -> None:
+        self.add_page("ActRaiser")
+        self.add_mislabelled_release()
+        records = self.crawl(self.options(ignore_game_mismatch=True))
+        record = self.record_for(records, "ActRaiser")
+        self.assertEqual("bad-3.0.0", record.release_tag)
+        self.assertEqual("Rune Factory", record.game)
+
+    def test_a_single_game_repository_is_not_second_guessed(self) -> None:
+        # Only one world here, so a name that does not match the page is naming drift, not a mixup.
+        self.releases["solo/repo"] = [release("v1", "thegame.apworld", repo="solo/repo")]
+        make_apworld(self.assets / "thegame.apworld", module="thegame", manifest=default_manifest("Some Old Game"))
+        href = "https://github.com/solo/repo"
+        self.pages["Totally Different Title"] = {
+            "title": "Totally Different Title",
+            "wikitext": f"{{{{Infobox game| download = [{href} Download] }}}}",
+            "text": wiki_page_html(title="Totally Different Title", download_href=href),
+            "externallinks": [href],
+        }
+        records = self.crawl()
+        record = self.record_for(records, "Totally Different Title")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertTrue(any("declares game" in warning for warning in record.warnings), record.warnings)
 
 
 class TestArchiveMode(CrawlTestCase):

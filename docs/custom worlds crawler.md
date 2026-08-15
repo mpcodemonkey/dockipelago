@@ -59,12 +59,52 @@ Anything resolved at `low` confidence is listed separately at the end of a run u
 was guessed rather than read from the infobox", so it can be spot checked. Links to core
 Archipelago, Discord, YouTube and similar are never treated as candidates.
 
-From there the link is turned into a file: a repository URL is resolved through its releases (newest
-non-draft, non-prerelease release that carries a `.apworld` asset), and a link that already points
-at a tag, a release asset or an `.apworld` file is used directly.
+From there the link is turned into a file: a repository URL is resolved through its releases, and a
+link that already points at a tag, a release asset or an `.apworld` file is used directly.
 
-When a release holds several `.apworld` assets, the one whose name best matches the repository or
-page title wins and the rest are noted. `--all-assets` takes every one of them instead.
+## Repositories that publish more than one game
+
+Plenty of maintainers look after several worlds and publish all of them from one repository, so its
+release feed interleaves unrelated games. A page for ActRaiser can point at a repository whose three
+most recent releases are Rune Factory, Sonic Battle and Rune Factory again — "newest release with an
+`.apworld` in it" fetches the wrong game almost every time.
+
+So a repository is classified first. If every `.apworld` it publishes has the same name, it is a
+one-world repository and its newest release wins, whatever anything is called. If it publishes
+several, every release becomes a candidate and each is scored against the game the page is about:
+
+1. **The asset file name** is the strongest signal — `actraiser.apworld` against ActRaiser.
+2. **The release tag and title** are worth slightly less, since they often carry only a version
+   number or the maintainer's own scheme — `actraiser-1.1.0` still matches, `v2.0.0` tells us
+   nothing.
+3. **The manifest's `game` field**, once the file has been downloaded, is authoritative. A name-based
+   pick is provisional until the manifest confirms it; if it names a different game, that candidate
+   is rejected and the next-best is tried.
+
+Matching is fuzzy in the ways these names actually vary — case, separators, camel case, version
+suffixes and `_apworld` suffixes are all absorbed, so `ActRaiser`, `act_raiser` and
+`actraiser-v1.2.0` are one game while `sonic_battle` is plainly not. A shared fragment is not enough
+on its own: a short name buried inside a longer one scores low, because most of the longer name is
+then unaccounted for.
+
+**A multi-game repository with nothing matching yields nothing.** The page is reported as failed,
+naming the games the repository does publish, rather than installing a confident guess. That is the
+whole point — a wrong world is worse than a missing one, because it silently claims a `game` name in
+the datapackage that belongs to something else.
+
+The game the page is about comes from the infobox's `game`/`title` parameter where there is one, and
+otherwise from the article title minus any `(disambiguation)` suffix.
+
+A one-world repository is deliberately *not* second-guessed: if its manifest names something other
+than the page title that is naming drift, not a mixup, so it installs with a warning. Use
+`--ignore-game-mismatch` to disable the rejection entirely if the filter misfires on an unusually
+named world — for example one whose asset is an abbreviation, like `smw.apworld` for Super Mario
+World.
+
+When a release holds several `.apworld` assets, the best match wins and the rest are noted.
+`--all-assets` installs every asset in the *chosen* release instead — other releases, meaning other
+games, are still left alone, and those extra assets are exempt from the game check since asking for
+all of them is explicit.
 
 ## What "verified" means
 
@@ -137,6 +177,7 @@ the games that failed and why.
 | `--limit N` | stop after N pages, handy while iterating |
 | `--output custom_worlds` | install somewhere other than `worlds/` |
 | `--allow-prerelease` | accept pre-release GitHub releases |
+| `--ignore-game-mismatch` | install even when the manifest names a different game than the page |
 | `--recursive` | descend into subcategories |
 | `--strict` | exit non-zero if any game failed |
 | `--keep-staging DIR` | keep the downloaded files for inspection |
@@ -149,6 +190,10 @@ the games that failed and why.
 - A page that links to a repository without releases, or whose releases carry no `.apworld`, is
   reported as failed. Some worlds are distributed as a repository to clone rather than a release
   asset; those need to be added by hand.
+- In a repository publishing several games, a world whose asset name shares nothing with the page —
+  an abbreviation like `smw.apworld`, or a codename — is refused rather than guessed at. The run
+  reports which games that repository does publish, so the fix is either `--ignore-game-mismatch` or
+  pointing the page's link straight at the right release.
 - Only one world per page is installed unless `--all-assets` is passed.
 - The crawler does not evaluate whether a world is any good, only whether core can load it. A world
   that imports cleanly can still fail during generation.
