@@ -12,6 +12,7 @@ from tools.custom_worlds.crawl import (
     INSTALL_EXTRACT,
     OUTCOME_FAILED,
     OUTCOME_INSTALLED,
+    OUTCOME_KNOWN_BAD,
     OUTCOME_RESOLVED,
     OUTCOME_SKIPPED,
     OUTCOME_UNCHANGED,
@@ -121,17 +122,30 @@ class CrawlTestCase(unittest.TestCase):
         settings.update(overrides)
         return CrawlOptions(**settings)
 
-    def crawl(self, options: CrawlOptions | None = None, *, write_lock: bool = True) -> list[GameRecord]:
+    def crawl(
+        self,
+        options: CrawlOptions | None = None,
+        *,
+        write_lock: bool = True,
+        versions: CoreVersions = VERSIONS,
+    ) -> list[GameRecord]:
         options = options or self.options()
         crawler = Crawler(
             options,
             WikiClient(self.http),  # type: ignore[arg-type]
             GitHubClient(self.http, token=None),  # type: ignore[arg-type]
-            VERSIONS,
+            versions,
         )
         records = crawler.run(self.staging)
         if write_lock and not options.dry_run:
-            write_lockfile(options.lockfile, records, options, VERSIONS)
+            write_lockfile(
+                options.lockfile,
+                records,
+                options,
+                versions,
+                previously_installed=crawler.previous,
+                previously_rejected=crawler.rejected,
+            )
         return records
 
     def record_for(self, records: list[GameRecord], title: str) -> GameRecord:
@@ -722,6 +736,228 @@ class TestWebWorldRejection(CrawlTestCase):
         self.assert_installed("good")
         self.assert_not_installed("bad")
         self.assert_not_installed("webless")
+
+
+class TestRejectionMemory(CrawlTestCase):
+    """A release rejected once is remembered, so it is never downloaded a second time."""
+
+    GOOD = TestWebWorldRejection.GOOD
+    NO_TUTORIALS = TestWebWorldRejection.NO_TUTORIALS
+
+    def asset_downloads(self) -> list[str]:
+        return [request for request in self.http.requests if "/releases/download/" in request]
+
+    def rejected(self) -> list[dict[str, Any]]:
+        return self.lock["rejected"]
+
+    def test_a_rejection_is_written_to_the_lockfile(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+
+        entries = self.rejected()
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("Some Game", entry["title"])
+        self.assertEqual("v1.0.0", entry["release_tag"])
+        self.assertEqual("mygame.apworld", entry["asset_name"])
+        self.assertEqual("invalid", entry["verification"])
+        self.assertEqual(["web-no-tutorials"], entry["codes"])
+        self.assertIn("invalid for WebHost", entry["reason"])
+        self.assertEqual(64, len(entry["sha256"]))
+        self.assertTrue(entry["first_rejected"])
+
+    def test_a_second_run_does_not_download_it_again(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+        self.assertEqual(1, len(self.asset_downloads()))
+
+        self.http.requests.clear()
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_KNOWN_BAD, record.outcome)
+        self.assertIn("invalid for WebHost", record.reason)
+        self.assertEqual([], self.asset_downloads())
+        self.assert_not_installed("mygame")
+
+    def test_the_rejection_survives_into_the_next_lockfile(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+        first = self.rejected()[0]["first_rejected"]
+        self.crawl()
+        entry = self.rejected()[0]
+        self.assertEqual(first, entry["first_rejected"], "the original date should be kept")
+        self.assertEqual(["web-no-tutorials"], entry["codes"])
+
+    def test_a_new_release_is_tried_again(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+
+        # The maintainer ships a fixed release; the memo is for the old tag only.
+        self.releases["owner/repo"].append(
+            release("v2.0.0", "mygame.apworld", published_at="2026-06-01T00:00:00Z")
+        )
+        make_apworld(
+            self.assets / "v2.0.0__mygame.apworld",
+            module="mygame",
+            manifest=default_manifest("Some Game Game"),
+            init_source=self.GOOD,
+        )
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assert_installed("mygame")
+        self.assertEqual([], self.rejected())
+
+    def test_refresh_re_checks_a_remembered_rejection(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+        self.http.requests.clear()
+        records = self.crawl(self.options(refresh=True))
+        self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Some Game").outcome)
+        self.assertEqual(1, len(self.asset_downloads()), "refresh should fetch it again")
+
+    def test_changing_the_webhost_policy_re_checks_it(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+        self.http.requests.clear()
+        records = self.crawl(self.options(webhost_check="off"))
+        self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Some Game").outcome)
+        self.assertEqual(1, len(self.asset_downloads()))
+        self.assert_installed("mygame")
+
+    def test_a_new_archipelago_version_re_checks_it(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+        self.http.requests.clear()
+        newer = CoreVersions(ap_version=(0, 7, 0), container_version=7)
+        records = self.crawl(versions=newer)
+        self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Some Game").outcome)
+        self.assertEqual(1, len(self.asset_downloads()), "a core upgrade could change the verdict")
+
+    def test_a_world_that_is_fine_leaves_no_rejection(self) -> None:
+        self.add_game("Some Game", init_source=self.GOOD)
+        self.crawl()
+        self.assertEqual([], self.rejected())
+
+
+class TestRemovingRejectedWorlds(CrawlTestCase):
+    """A world already in worlds/ that is no longer acceptable gets taken out again."""
+
+    GOOD = TestWebWorldRejection.GOOD
+    NO_TUTORIALS = TestWebWorldRejection.NO_TUTORIALS
+
+    def install_then_break(self) -> None:
+        """Install a world under a lenient policy, then make the checks reject the same release."""
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl(self.options(webhost_check="off"))
+        self.assert_installed("mygame")
+
+    def test_a_previously_installed_world_is_removed(self) -> None:
+        self.install_then_break()
+        records = self.crawl()  # default policy rejects it
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertEqual(self.relative("mygame"), record.removed)
+        self.assert_not_installed("mygame")
+
+    def test_the_removal_is_recorded_in_the_lockfile(self) -> None:
+        self.install_then_break()
+        self.crawl()
+        self.assertEqual([], self.lock["worlds"])
+        entry = self.lock["rejected"][0]
+        self.assertEqual(self.relative("mygame"), entry["removed"])
+
+    def test_the_removal_is_still_recorded_on_later_runs(self) -> None:
+        self.install_then_break()
+        self.crawl()
+        self.crawl()
+        entry = self.lock["rejected"][0]
+        self.assertEqual(self.relative("mygame"), entry["removed"], "the removal should not be forgotten")
+
+    def test_the_removed_world_is_not_downloaded_again(self) -> None:
+        self.install_then_break()
+        self.crawl()
+        self.http.requests.clear()
+        records = self.crawl()
+        self.assertEqual(OUTCOME_KNOWN_BAD, self.record_for(records, "Some Game").outcome)
+        self.assertEqual([], [r for r in self.http.requests if "/releases/download/" in r])
+        self.assert_not_installed("mygame")
+
+    def test_a_dry_run_removes_nothing(self) -> None:
+        self.install_then_break()
+        self.crawl(self.options(dry_run=True))
+        self.assert_installed("mygame")
+
+    def test_a_working_older_release_is_kept_when_the_newest_is_broken(self) -> None:
+        # v1 is fine and installed; v2 is broken. Losing a working game would be a bad trade.
+        self.add_game("Some Game", init_source=self.GOOD)
+        self.crawl()
+        self.assert_installed("mygame")
+
+        self.releases["owner/repo"].append(
+            release("v2.0.0", "mygame.apworld", published_at="2026-06-01T00:00:00Z")
+        )
+        make_apworld(
+            self.assets / "v2.0.0__mygame.apworld",
+            module="mygame",
+            manifest=default_manifest("Some Game Game"),
+            init_source=self.NO_TUTORIALS,
+        )
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertEqual("", record.removed)
+        self.assert_installed("mygame")
+        self.assertTrue(any("keeping the installed v1.0.0" in note for note in record.notes), record.notes)
+
+    def test_worlds_not_installed_by_the_crawler_are_never_touched(self) -> None:
+        bystander = self.root / "worlds" / "mygame"
+        bystander.mkdir()
+        (bystander / "__init__.py").write_text("# hand placed\n", encoding="utf-8")
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        self.crawl()
+        self.assertEqual("# hand placed\n", (bystander / "__init__.py").read_text(encoding="utf-8"))
+
+
+class TestPartialRuns(CrawlTestCase):
+    """--only and --limit must not make the crawler forget everything they skipped."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_game("Game A", repo="a/a", asset_name="game_a.apworld")
+        self.add_game("Game B", repo="b/b", asset_name="game_b.apworld")
+        self.crawl()
+
+    def test_only_keeps_the_other_worlds_in_the_lockfile(self) -> None:
+        self.crawl(self.options(only=("Game A",)))
+        self.assertEqual(["Game A", "Game B"], [entry["title"] for entry in self.lock["worlds"]])
+
+    def test_only_with_prune_does_not_delete_the_other_worlds(self) -> None:
+        self.crawl(self.options(only=("Game A",), prune=True))
+        self.assert_installed("game_a")
+        self.assert_installed("game_b")
+
+    def test_limit_keeps_the_other_worlds(self) -> None:
+        self.crawl(self.options(limit=1, prune=True))
+        self.assertEqual(2, len(self.lock["worlds"]))
+        self.assert_installed("game_a")
+        self.assert_installed("game_b")
+
+    def test_a_full_run_still_prunes_what_left_the_category(self) -> None:
+        del self.pages["Game B"]
+        self.crawl(self.options(prune=True))
+        self.assert_installed("game_a")
+        self.assertFalse(self.world_path("game_b").exists())
+        self.assertEqual(["Game A"], [entry["title"] for entry in self.lock["worlds"]])
+
+    def test_a_partial_run_keeps_another_pages_rejection(self) -> None:
+        self.add_game("Game C", repo="c/c", asset_name="game_c.apworld",
+                      init_source=TestWebWorldRejection.NO_TUTORIALS)
+        self.crawl()
+        self.assertEqual(["Game C"], [entry["title"] for entry in self.lock["rejected"]])
+
+        self.crawl(self.options(only=("Game A",)))
+        self.assertEqual(["Game C"], [entry["title"] for entry in self.lock["rejected"]])
 
 
 class TestArchiveMode(CrawlTestCase):

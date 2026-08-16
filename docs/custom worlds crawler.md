@@ -180,6 +180,9 @@ serve exactly that. `--webhost-check warn` installs them anyway and lists them a
 and `--webhost-check off` skips the question entirely. Neither setting can rescue a world from the
 first group.
 
+Refusing them also means **taking back out** any copy an earlier run installed — see
+[Rejected worlds](#rejected-worlds) below.
+
 **Only `<name>/__init__.py` is inspected, and only provable problems are reported.** A world that
 keeps its `WebWorld` in a separate module — `web = MyGameWeb()` with `MyGameWeb` imported — is left
 alone, as are worlds that inherit `web` or `tutorials` from a base class this file cannot see, assign
@@ -221,23 +224,72 @@ parties, and one that names a path outside its own folder is rejected rather tha
 
 ## The lockfile
 
-Every run writes `custom_worlds.lock.json`, recording for each installed world its wiki page,
-repository, release tag, asset name, SHA-256, resolved game name and world version. It exists so
-that:
+Every run writes `custom_worlds.lock.json`. It has two lists.
+
+`worlds` records each installed world's wiki page, repository, release tag, asset name, SHA-256,
+resolved game name and world version, so that:
 
 - a later run can tell what actually changed, and skip re-downloading releases that did not move;
 - the contents of `worlds/` can be traced back to a page and a release tag during review;
 - `--prune` knows which worlds it installed, and so can remove ones that have left the category
   without ever touching a world that ships with Archipelago or one placed by hand.
 
-Use `--refresh` to re-download regardless, and `--report FILE` for a per-page JSON report including
-the games that failed and why.
+### Rejected worlds
+
+`rejected` records the releases that were turned down and why, so a broken release is downloaded
+exactly once:
+
+```json
+{
+  "title": "Some Game",
+  "release_tag": "v1.0.0",
+  "asset_name": "some_game.apworld",
+  "sha256": "7a45e033…",
+  "verification": "invalid",
+  "codes": ["web-no-tutorials"],
+  "reason": "MyGameWeb defines no 'tutorials', so WebHost.py drops it …",
+  "removed": "worlds/some_game",
+  "first_rejected": "2026-08-16T23:10:33Z",
+  "checked": {
+    "checks_version": 2,
+    "archipelago_version": "0.6.8",
+    "container_version": 7,
+    "webhost_check": "error"
+  }
+}
+```
+
+On the next run the page and its release list are still checked — a new release may well have fixed
+the problem — but if the newest release is one already recorded here, it is skipped without being
+fetched, and reported as `known-bad`.
+
+Each entry fingerprints the checks that produced the verdict, and stops applying by itself when any
+of them moves: a newer Archipelago version, a different `--webhost-check` policy, or a bump to
+`checks_version` when the checks themselves change. That last one is what lets a newly added check
+reach worlds installed before it existed — their lockfile entries no longer match, so they are
+re-downloaded and re-verified rather than trusted.
+
+**A world that becomes unacceptable is removed from the output directory**, and `removed` records
+where it was. Only the exact release that was rejected is deleted: if an older, working release is
+what is actually installed, it stays and the run says so, because a broken new release is no reason
+to lose a game that works. As everywhere else, only paths the crawler recorded installing are ever
+touched. `--dry-run` reports what it would remove without removing it.
+
+Use `--refresh` to re-download and re-check everything regardless of either list, and `--report FILE`
+for a per-page JSON report including the games that failed and why.
+
+### Partial runs
+
+`--only` and `--limit` visit some of the category, so they are careful not to speak for the rest:
+pages they did not visit keep their existing entries in both lists, and `--prune` leaves those worlds
+alone. Only a full crawl treats a page's absence from the run as its absence from the wiki.
 
 ## Useful options
 
 | Option | Effect |
 | --- | --- |
-| `--dry-run` | resolve, download and verify, but write nothing |
+| `--dry-run` | resolve, download and verify, but write nothing (and report what it would remove) |
+| `--refresh` | re-download and re-check everything, ignoring both lockfile lists |
 | `--only "Page Title" …` | process specific pages instead of the whole category |
 | `--limit N` | stop after N pages, handy while iterating |
 | `--output custom_worlds` | install somewhere other than `worlds/` |

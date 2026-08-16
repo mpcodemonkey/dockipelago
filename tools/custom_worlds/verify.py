@@ -82,6 +82,8 @@ class VerificationResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     manifest: Manifest | None = None
+    #: Machine-readable codes for the problems found, so a run can be diffed against a later one.
+    codes: list[str] = field(default_factory=list)
 
     @property
     def module_name(self) -> str:
@@ -232,11 +234,11 @@ def _check_webworld(
         return
 
     for finding in inspect_source(source, module_name=path.stem):
-        if finding.blocks_loading:
-            result.fail(STATUS_INVALID, finding.detail)
-        elif webhost_check == WEBHOST_ERROR:
+        if finding.blocks_loading or webhost_check == WEBHOST_ERROR:
+            result.codes.append(finding.code)
             result.fail(STATUS_INVALID, finding.detail)
         elif webhost_check == WEBHOST_WARN:
+            result.codes.append(finding.code)
             result.warn(finding.detail)
 
 

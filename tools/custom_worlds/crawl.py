@@ -30,6 +30,7 @@ from .http import HttpClient, HttpError
 from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
 from .verify import (
+    STATUS_INVALID,
     STATUS_OK,
     WEBHOST_ERROR,
     WEBHOST_POLICIES,
@@ -68,8 +69,14 @@ OUTCOME_UNCHANGED = "unchanged"
 OUTCOME_SKIPPED = "skipped"
 OUTCOME_FAILED = "failed"
 OUTCOME_RESOLVED = "resolved"  # --dry-run only
+OUTCOME_KNOWN_BAD = "known-bad"  # rejected by an earlier run, so not downloaded again
 
-_FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED})
+_FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED, OUTCOME_KNOWN_BAD})
+
+#: Bumped whenever the checks change their mind about what is acceptable. Lockfile entries written
+#: by an older version are re-verified rather than trusted, so a new check reaches worlds that were
+#: installed before it existed.
+CHECKS_VERSION = 2
 
 
 @dataclass
@@ -96,6 +103,10 @@ class GameRecord:
     game: str = ""
     world_version: str = ""
     verification: str = ""
+    #: Machine-readable codes for why a world was rejected.
+    codes: list[str] = field(default_factory=list)
+    #: Path removed from the output directory because what was installed there is now rejected.
+    removed: str = ""
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -126,6 +137,15 @@ class CrawlOptions:
     webhost_check: str = WEBHOST_ERROR
     max_asset_bytes: int = DEFAULT_MAX_ASSET_BYTES
 
+    @property
+    def full_crawl(self) -> bool:
+        """Whether this run saw the whole category, and so can speak for what is no longer in it.
+
+        Under --only or --limit the pages that went unvisited say nothing at all, so their absence
+        from the run must not be read as their absence from the wiki.
+        """
+        return not self.only and self.limit is None
+
 
 class Crawler:
     """Runs the pipeline and collects a record per game."""
@@ -142,7 +162,10 @@ class Crawler:
         self.github = github
         self.versions = versions
         self.records: list[GameRecord] = []
-        self.previous = _read_lockfile(options.lockfile)
+        previous, rejected = _read_lockfile(options.lockfile)
+        self.previous = previous
+        #: What earlier runs rejected, so the same broken release is not fetched again.
+        self.rejected = rejected
 
     def run(self, staging: Path) -> list[GameRecord]:
         titles = self._titles()
@@ -248,6 +271,18 @@ class Crawler:
             logger.info("  unchanged (%s %s)", asset.source, asset.release_tag or asset.name)
             return None
 
+        remembered = self._remembered_rejection(record)
+        if remembered is not None:
+            record.outcome = OUTCOME_KNOWN_BAD
+            record.reason = str(remembered.get("reason") or "rejected by an earlier run")
+            record.verification = str(remembered.get("verification") or STATUS_INVALID)
+            record.codes = [str(code) for code in remembered.get("codes") or []]
+            record.game = str(remembered.get("game") or "")
+            record.sha256 = str(remembered.get("sha256") or "")
+            logger.info("  known bad, not downloaded again: %s", record.reason)
+            self._remove_installed(record)
+            return None
+
         try:
             payload = self.github.download(asset, max_bytes=self.options.max_asset_bytes)
         except HttpError as error:
@@ -283,7 +318,9 @@ class Crawler:
         if not result.installable:
             record.outcome = OUTCOME_SKIPPED
             record.reason = "; ".join(result.errors) or result.status
+            record.codes = list(result.codes)
             logger.warning("  %s: %s", result.status, record.reason)
+            self._remove_installed(record)
             return None
 
         record.outcome = OUTCOME_RESOLVED
@@ -364,6 +401,8 @@ class Crawler:
         previous = self.previous.get(_lock_key(record.title, record.asset_name))
         if previous is None or previous.get("release_tag") != record.release_tag:
             return False
+        if not self._checked_the_same_way(previous):
+            return False  # written before a check changed; re-verify rather than trust it
         if previous.get("install_mode", INSTALL_ARCHIVE) != self.options.install_mode:
             return False
 
@@ -384,6 +423,63 @@ class Crawler:
         record.world_version = str(previous.get("world_version") or "")
         record.verification = str(previous.get("verification") or STATUS_OK)
         return True
+
+    def _checked_the_same_way(self, entry: dict[str, Any]) -> bool:
+        """Whether a lockfile entry was produced by the same checks this run is applying.
+
+        A verdict is only worth trusting if nothing that could change it has moved: the checks
+        themselves, the Archipelago version the world was measured against, and the policy for
+        worlds the WebHost would drop.
+        """
+        checked = entry.get("checked")
+        if not isinstance(checked, dict):
+            return False
+        return (
+            checked.get("checks_version") == CHECKS_VERSION
+            and checked.get("archipelago_version") == self.versions.ap_version_string
+            and checked.get("container_version") == self.versions.container_version
+            and checked.get("webhost_check") == self.options.webhost_check
+        )
+
+    def _remembered_rejection(self, record: GameRecord) -> dict[str, Any] | None:
+        """A previous run's verdict on this exact release, if it still applies."""
+        if self.options.refresh:
+            return None
+        entry = self.rejected.get(_lock_key(record.title, record.asset_name))
+        if entry is None or entry.get("release_tag") != record.release_tag:
+            return None  # a new release may well have fixed it, so try again
+        return entry if self._checked_the_same_way(entry) else None
+
+    def _remove_installed(self, record: GameRecord) -> None:
+        """Delete a previously installed copy of a world this run has just rejected.
+
+        Only the exact release that was rejected is removed. If an older, working release is what is
+        actually installed, it stays: a broken new release is no reason to lose a game that works.
+        Only paths this crawler recorded installing are ever touched.
+        """
+        previous = self.previous.get(_lock_key(record.title, record.asset_name))
+        if previous is None or not previous.get("file"):
+            return
+        if previous.get("release_tag") != record.release_tag:
+            record.notes.append(
+                f"keeping the installed {previous.get('release_tag')}, which is not the release that was rejected"
+            )
+            logger.info("  keeping installed %s", previous.get("release_tag"))
+            return
+
+        installed = self.options.root / str(previous["file"])
+        if installed.parent != self.options.output_dir or not installed.exists():
+            return
+        if self.options.dry_run:
+            logger.warning("  would remove %s (rejected)", previous["file"])
+            return
+
+        if installed.is_dir():
+            shutil.rmtree(installed)
+        else:
+            installed.unlink()
+        record.removed = str(previous["file"])
+        logger.warning("  removed %s, which is no longer acceptable", record.removed)
 
     def _apply_conflicts(self, verified: dict[Path, tuple[GameRecord, VerificationResult]]) -> None:
         results = [result for _record, result in verified.values()]
@@ -439,15 +535,19 @@ class Crawler:
         """Delete worlds a previous run installed that this run no longer wants.
 
         Only paths recorded in the lockfile are considered, so hand-placed worlds and the worlds
-        that ship with Archipelago are never touched.
+        that ship with Archipelago are never touched. Pages this run did not look at are left alone
+        too: under --only or --limit their absence from this run says nothing about the wiki.
         """
         # Worlds this run reused without re-downloading are still wanted, so keep them too.
         keep = set(installed)
         keep.update(self.options.root / record.file for record in self.records if record.succeeded and record.file)
+        processed = {record.title for record in self.records}
 
         for entry in self.previous.values():
             relative = str(entry.get("file") or "")
             if not relative:
+                continue
+            if not self.options.full_crawl and str(entry.get("title")) not in processed:
                 continue
             stale = self.options.root / relative
             if stale in keep or stale.parent != output or not stale.exists():
@@ -464,8 +564,32 @@ class Crawler:
 # --------------------------------------------------------------------------------------
 
 
-def write_lockfile(path: Path, records: Sequence[GameRecord], options: CrawlOptions, versions: CoreVersions) -> None:
-    """Record what is installed so the next run can diff against it."""
+def write_lockfile(
+    path: Path,
+    records: Sequence[GameRecord],
+    options: CrawlOptions,
+    versions: CoreVersions,
+    *,
+    previously_installed: dict[str, dict[str, Any]] | None = None,
+    previously_rejected: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Record what is installed, and what was rejected, so the next run can skip both.
+
+    The rejected list is the reason a broken release is only ever downloaded once. Each entry
+    fingerprints the checks that produced the verdict, so it stops applying by itself when the
+    Archipelago version, the WebHost policy or the checks themselves change.
+    """
+    checked = {
+        "checks_version": CHECKS_VERSION,
+        "archipelago_version": versions.ap_version_string,
+        "container_version": versions.container_version,
+        "webhost_check": options.webhost_check,
+    }
+    ordered = sorted(records, key=lambda item: item.title.lower())
+    # A partial run (--only, --limit) must not erase everything it did not look at. A full one may:
+    # a page missing from a full crawl really has left the category.
+    processed = {record.title for record in records} if not options.full_crawl else None
+
     worlds = [
         {
             "title": record.title,
@@ -484,21 +608,85 @@ def write_lockfile(path: Path, records: Sequence[GameRecord], options: CrawlOpti
             "world_version": record.world_version,
             "verification": record.verification,
             "warnings": record.warnings,
+            "checked": checked,
         }
-        for record in sorted(records, key=lambda item: item.title.lower())
+        for record in ordered
         if record.succeeded and record.file
     ]
+    worlds = _merge(worlds, previously_installed or {}, processed)
+
+    rejected = _rejected_entries(ordered, checked, previously_rejected or {})
+    rejected = _merge(rejected, previously_rejected or {}, processed)
+
     payload = {
-        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": _now(),
         "archipelago_version": versions.ap_version_string,
         "container_version": versions.container_version,
+        "checks_version": CHECKS_VERSION,
         "category": options.category,
         "install_mode": options.install_mode,
+        "webhost_check": options.webhost_check,
         "output_dir": str(_relative(options.output_dir, options.root)),
         "worlds": worlds,
+        "rejected": rejected,
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
-    logger.info("Wrote %s (%d world(s))", path, len(worlds))
+    logger.info("Wrote %s (%d world(s), %d rejected)", path, len(worlds), len(rejected))
+
+
+def _now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _merge(
+    current: list[dict[str, Any]],
+    earlier: dict[str, dict[str, Any]],
+    processed: set[str] | None,
+) -> list[dict[str, Any]]:
+    """Add back entries for pages a partial run never visited, so it keeps the rest.
+
+    ``processed`` is None after a full crawl, where the run's own records are the whole truth.
+    """
+    if processed is None:
+        return current
+    carried = [entry for entry in earlier.values() if str(entry.get("title")) not in processed]
+    return sorted(current + carried, key=lambda entry: str(entry.get("title", "")).lower())
+
+
+def _rejected_entries(
+    records: Sequence[GameRecord],
+    checked: dict[str, Any],
+    previously_rejected: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the rejected list, keeping the date each release was first turned down."""
+    entries: list[dict[str, Any]] = []
+    for record in records:
+        if record.outcome not in (OUTCOME_SKIPPED, OUTCOME_KNOWN_BAD) or not record.asset_name:
+            continue
+        earlier = previously_rejected.get(_lock_key(record.title, record.asset_name), {})
+        if earlier.get("release_tag") != record.release_tag:
+            earlier = {}  # a different release, so none of its history carries over
+        entries.append(
+            {
+                "title": record.title,
+                "page_url": record.page_url,
+                "game": record.game,
+                "repo": record.repo,
+                "release_tag": record.release_tag,
+                "asset_name": record.asset_name,
+                "download_url": record.download_url,
+                "sha256": record.sha256,
+                "verification": record.verification or STATUS_INVALID,
+                "codes": record.codes,
+                "reason": record.reason,
+                # Both are kept across runs so the lockfile still shows when a release was first
+                # turned down, and that a copy of it was taken back out of the output directory.
+                "removed": record.removed or str(earlier.get("removed") or ""),
+                "first_rejected": earlier.get("first_rejected") or _now(),
+                "checked": checked,
+            }
+        )
+    return entries
 
 
 def write_report(path: Path, records: Sequence[GameRecord]) -> None:
@@ -515,6 +703,13 @@ def log_summary(records: Sequence[GameRecord]) -> None:
     logger.info("")
     tally = ", ".join(f"{count} {outcome}" for outcome, count in sorted(counts.items()))
     logger.info("Summary: %s", tally or "nothing")
+
+    removed = [record for record in records if record.removed]
+    if removed:
+        logger.info("")
+        logger.info("Removed from the output directory, having become unacceptable:")
+        for record in sorted(removed, key=lambda item: item.title.lower()):
+            logger.info("  %-30s %s", record.title, record.removed)
 
     problems = [record for record in records if not record.succeeded]
     if problems:
@@ -681,20 +876,26 @@ def _lock_key(title: str, asset_name: str) -> str:
     return f"{title}\x1f{asset_name}"
 
 
-def _read_lockfile(path: Path) -> dict[str, dict[str, Any]]:
+def _read_lockfile(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Return the previously installed worlds and the previously rejected releases, both keyed."""
     if not path.is_file():
-        return {}
+        return {}, {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         logger.warning("ignoring unreadable lockfile %s: %s", path, error)
-        return {}
-    worlds = payload.get("worlds") if isinstance(payload, dict) else None
-    if not isinstance(worlds, list):
+        return {}, {}
+    if not isinstance(payload, dict):
+        return {}, {}
+    return _index(payload.get("worlds")), _index(payload.get("rejected"))
+
+
+def _index(entries: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(entries, list):
         return {}
     return {
         _lock_key(str(entry.get("title")), str(entry.get("asset_name", ""))): entry
-        for entry in worlds
+        for entry in entries
         if isinstance(entry, dict) and entry.get("title")
     }
 
@@ -747,7 +948,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="install an apworld even when its manifest names a different game than the wiki page; "
         "only useful if the game filter misfires on an unusually named world",
     )
-    parser.add_argument("--refresh", action="store_true", help="re-download even when the lockfile says nothing moved")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-download and re-check everything, ignoring both the installed and rejected lists",
+    )
     parser.add_argument(
         "--prune",
         action="store_true",
@@ -823,7 +1028,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     exit_code = 0
     if not options.dry_run:
-        write_lockfile(options.lockfile, records, options, versions)
+        write_lockfile(
+            options.lockfile,
+            records,
+            options,
+            versions,
+            previously_installed=crawler.previous,
+            previously_rejected=crawler.rejected,
+        )
         if args.import_check:
             passed, detail = run_import_check(root)
             if not passed:
