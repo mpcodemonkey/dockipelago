@@ -8,6 +8,7 @@ from tools.custom_worlds.matching import (
     matches,
     name_score,
     normalize,
+    strip_version,
     tokenize,
 )
 
@@ -32,11 +33,53 @@ class TestTokenize(unittest.TestCase):
         self.assertEqual(["rune", "factory", "5"], tokenize("rune_factory_5"))
 
     def test_drops_noise_words(self) -> None:
-        self.assertEqual(["kirby", "1"], tokenize("kirby_apworld_v1"))
+        self.assertEqual(["kirby"], tokenize("kirby_apworld_v1"))
         self.assertEqual(["kirby"], tokenize("kirby_apworld_archipelago"))
 
     def test_keeps_noise_words_when_that_is_all_there_is(self) -> None:
         self.assertEqual(["apworld"], tokenize("apworld"))
+
+
+class TestStripVersion(unittest.TestCase):
+    def test_removes_a_v_prefixed_version(self) -> None:
+        self.assertEqual(["mega", "man", "x", "2"], tokenize("Mega Man X2 v1.1"))
+
+    def test_removes_a_dotted_version(self) -> None:
+        self.assertEqual(["runefactory"], tokenize("runefactory-2.0.0"))
+
+    def test_removes_a_version_after_an_underscore(self) -> None:
+        # "_" is a word character, so this only works because separators are normalised first.
+        self.assertEqual(["mmx"], tokenize("mmx_v1.4"))
+
+    def test_keeps_a_bare_series_number(self) -> None:
+        # The "5" in "Rune Factory 5" is the name, not a version.
+        self.assertEqual(["rune", "factory", "5"], tokenize("Rune Factory 5"))
+        self.assertIn("2", tokenize("Mega Man X2"))
+
+    def test_leaves_a_plain_name_alone(self) -> None:
+        self.assertEqual("ActRaiser", strip_version("ActRaiser"))
+
+
+class TestSeriesNumbers(unittest.TestCase):
+    """Numbered entries in one series share nearly every word, so the number has to decide."""
+
+    def test_different_entries_never_match(self) -> None:
+        self.assertEqual(0, name_score("Mega Man X1", "Mega Man X2"))
+        self.assertEqual(0, name_score("Mega Man X1", "Mega Man X3 v1.0"))
+        self.assertEqual(0, name_score("Rune Factory 4", "rune_factory_5"))
+
+    def test_the_same_entry_still_matches(self) -> None:
+        self.assertEqual(100, name_score("Mega Man X2", "mega_man_x2"))
+        self.assertGreaterEqual(name_score("Mega Man X1", "Mega Man X1 v1.2"), MIN_MATCH_SCORE)
+
+    def test_a_version_number_is_not_mistaken_for_a_series_number(self) -> None:
+        # Without version stripping the "1" in "v1.1" would make this look like X1.
+        self.assertEqual(0, name_score("Mega Man X1", "Mega Man X2 v1.1"))
+
+    def test_a_number_on_only_one_side_is_not_disqualifying(self) -> None:
+        # A page called "Rune Factory" may well be describing "Rune Factory 5".
+        self.assertGreater(name_score("Rune Factory", "runefactory5"), 0)
+        self.assertGreater(name_score("Mega Man X1", "Mega Man X"), 0)
 
 
 class TestNameScore(unittest.TestCase):

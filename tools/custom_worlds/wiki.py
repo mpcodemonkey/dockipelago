@@ -56,7 +56,10 @@ DOWNLOAD_LABEL_RE = re.compile(r"download|apworld|repositor|source|releases?\b|g
 #: The heading that separates the Archipelago-specific half of a game infobox.
 AP_SECTION_RE = re.compile(r"\bap\b[\s_-]*(information|info)\b|archipelago[\s_-]*information", re.IGNORECASE)
 
-_URL_RE = re.compile(r"https?://[^\s\]\}\|<>\"']+")
+# Quotes are allowed inside the URL, because GitHub's own filtered-releases links contain them:
+# /releases?q="Mega Man X"&expanded=true. A quote that really was a delimiter ends up at the end,
+# where the trailing-punctuation strip removes it.
+_URL_RE = re.compile(r"https?://[^\s\]\}\|<>]+")
 _TRAILING_PUNCTUATION = ".,;:!?'\")"
 
 #: Hosts that are never an apworld download, so the ranked fallback should not pick them.

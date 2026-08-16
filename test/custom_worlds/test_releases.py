@@ -60,6 +60,99 @@ class TestParseGitHubUrl(unittest.TestCase):
         self.assertIsNone(parse_github_url("https://github.com/owner"))
 
 
+class TestReleaseQuery(unittest.TestCase):
+    """A filtered releases link carries the maintainer's own answer about which releases apply."""
+
+    MEGA_MAN_X = 'https://github.com/TheLX5/Archipelago/releases?q="Mega+Man+X"&expanded=true'
+
+    def test_the_query_is_read_off_a_filtered_releases_link(self) -> None:
+        target = parse_github_url(self.MEGA_MAN_X)
+        assert target is not None
+        self.assertEqual("TheLX5/Archipelago", target.slug)
+        self.assertEqual("Mega Man X", target.release_query)
+
+    def test_quoting_and_encoding_are_handled(self) -> None:
+        for url, expected in (
+            ("https://github.com/o/r/releases?q=%22Mega+Man+X%22", "Mega Man X"),
+            ("https://github.com/o/r/releases?q=Mega+Man+X", "Mega Man X"),
+            ("https://github.com/o/r/releases?q=%22Sonic%20Battle%22&expanded=true", "Sonic Battle"),
+            ("https://github.com/o/r/releases?expanded=true&q=actraiser", "actraiser"),
+        ):
+            target = parse_github_url(url)
+            assert target is not None
+            self.assertEqual(expected, target.release_query, url)
+
+    def test_a_releases_link_without_a_query_has_none(self) -> None:
+        target = parse_github_url("https://github.com/o/r/releases")
+        assert target is not None
+        self.assertEqual("", target.release_query)
+
+    def test_a_query_elsewhere_is_ignored(self) -> None:
+        target = parse_github_url("https://github.com/o/r?q=nonsense")
+        assert target is not None
+        self.assertEqual("", target.release_query)
+
+    def _releases(self) -> list[Any]:
+        return [
+            release("smw-3.0.1", "smw.apworld", published_at="2026-07-01T00:00:00Z"),
+            release("Mega Man X3 v1.0", "mmx3.apworld", published_at="2026-06-01T00:00:00Z"),
+            release("Mega Man X2 v1.1", "mmx2.apworld", published_at="2026-05-01T00:00:00Z"),
+            release("Mega Man X1 v1.4", "mmx.apworld", published_at="2026-04-01T00:00:00Z"),
+            release("yoshisisland-2.2", "yoshi.apworld", published_at="2026-03-01T00:00:00Z"),
+        ]
+
+    def test_the_filter_narrows_the_feed(self) -> None:
+        resolution = select_apworld_assets(
+            self._releases(), expected_game="Mega Man X1", release_query="Mega Man X", source="o/r"
+        )
+        self.assertEqual("mmx.apworld", resolution.selected[0].name)
+        self.assertTrue(any("leaving 3 of 5" in note for note in resolution.notes), resolution.notes)
+
+    def test_each_entry_in_the_series_resolves_to_its_own_release(self) -> None:
+        for expected, asset in (
+            ("Mega Man X1", "mmx.apworld"),
+            ("Mega Man X2", "mmx2.apworld"),
+            ("Mega Man X3", "mmx3.apworld"),
+        ):
+            resolution = select_apworld_assets(
+                self._releases(), expected_game=expected, release_query="Mega Man X", source="o/r"
+            )
+            self.assertEqual(asset, resolution.selected[0].name, expected)
+
+    def test_the_filter_keeps_the_newest_matching_release(self) -> None:
+        # Only one game inside the filter, so the newest of it wins without any name guessing.
+        releases = [
+            release("smw-3.0.1", "smw.apworld", published_at="2026-07-01T00:00:00Z"),
+            release("Mega Man X v2.0", "mmx.apworld", published_at="2026-06-01T00:00:00Z"),
+            release("Mega Man X v1.0", "mmx.apworld", published_at="2026-01-01T00:00:00Z"),
+        ]
+        resolution = select_apworld_assets(
+            releases, expected_game="Anything At All", release_query="Mega Man X", source="o/r"
+        )
+        self.assertEqual("Mega Man X v2.0", resolution.selected[0].release_tag)
+        self.assertFalse(resolution.multi_game, "the filter left one game, so there is nothing to guess")
+
+    def test_a_filter_that_matches_nothing_falls_back_to_the_whole_feed(self) -> None:
+        resolution = select_apworld_assets(
+            self._releases(), expected_game="Super Mario World", release_query="Renamed Long Ago", source="o/r"
+        )
+        self.assertTrue(any("no release matches it any more" in note for note in resolution.notes))
+
+    def test_the_filter_rescues_a_game_the_name_matching_would_refuse(self) -> None:
+        # "smw" is an abbreviation the matcher cannot connect to "Super Mario World" on its own.
+        releases = [
+            release("smw-3.0.1", "smw.apworld", published_at="2026-07-01T00:00:00Z"),
+            release("mmx-1.0", "mmx.apworld", published_at="2026-06-01T00:00:00Z"),
+        ]
+        refused = select_apworld_assets(releases, expected_game="Super Mario World", source="o/r")
+        self.assertEqual([], refused.selected)
+
+        resolution = select_apworld_assets(
+            releases, expected_game="Super Mario World", release_query="smw", source="o/r"
+        )
+        self.assertEqual("smw.apworld", resolution.selected[0].name)
+
+
 class TestSelectApworldAssets(unittest.TestCase):
     def test_picks_the_newest_release_that_has_an_apworld(self) -> None:
         releases = [

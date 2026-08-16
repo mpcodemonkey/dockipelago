@@ -960,6 +960,93 @@ class TestPartialRuns(CrawlTestCase):
         self.assertEqual(["Game C"], [entry["title"] for entry in self.lock["rejected"]])
 
 
+class TestFilteredReleasesLink(CrawlTestCase):
+    """A wiki page linking to a filtered releases page, as Mega Man X1 does.
+
+    The link is https://github.com/TheLX5/Archipelago/releases?q="Mega+Man+X"&expanded=true, and the
+    repository is a whole Archipelago fork: dozens of games, with Mega Man X releases nowhere near
+    the top of the feed.
+    """
+
+    REPO = "TheLX5/Archipelago"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.releases[self.REPO] = [
+            release("smw-3.0.1", "smw.apworld", published_at="2026-07-01T00:00:00Z", repo=self.REPO),
+            release("Mega Man X3 v1.0", "mmx3.apworld", published_at="2026-06-01T00:00:00Z", repo=self.REPO),
+            release("Mega Man X2 v1.1", "mmx2.apworld", published_at="2026-05-01T00:00:00Z", repo=self.REPO),
+            release("Mega Man X1 v1.4", "mmx.apworld", published_at="2026-04-01T00:00:00Z", repo=self.REPO),
+            release("yoshi-2.2", "yoshi.apworld", published_at="2026-03-01T00:00:00Z", repo=self.REPO),
+        ]
+        for stem, game in (
+            ("smw", "Super Mario World"),
+            ("mmx3", "Mega Man X3"),
+            ("mmx2", "Mega Man X2"),
+            ("mmx", "Mega Man X1"),
+            ("yoshi", "Yoshi's Island"),
+        ):
+            make_apworld(self.assets / f"{stem}.apworld", module=stem, manifest=default_manifest(game))
+
+    def add_page(self, title: str, href: str) -> None:
+        self.pages[title] = {
+            "title": title,
+            "wikitext": f"{{{{Infobox game| game = {title} | download = [{href} Download] }}}}",
+            "text": wiki_page_html(title=title, download_href=href),
+            "externallinks": [href],
+        }
+
+    def filtered(self, query: str) -> str:
+        return f'https://github.com/{self.REPO}/releases?q="{query.replace(" ", "+")}"&expanded=true'
+
+    def test_the_link_filter_picks_the_right_game(self) -> None:
+        self.add_page("Mega Man X1", self.filtered("Mega Man X"))
+        records = self.crawl()
+        record = self.record_for(records, "Mega Man X1")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertEqual("mmx.apworld", record.asset_name)
+        self.assertEqual("Mega Man X1 v1.4", record.release_tag)
+        self.assertEqual("Mega Man X1", record.game)
+        self.assert_installed("mmx")
+
+    def test_each_page_in_the_series_gets_its_own_release(self) -> None:
+        for title in ("Mega Man X1", "Mega Man X2", "Mega Man X3"):
+            self.add_page(title, self.filtered("Mega Man X"))
+        records = self.crawl()
+        self.assertEqual(
+            {"Mega Man X1": "Mega Man X1", "Mega Man X2": "Mega Man X2", "Mega Man X3": "Mega Man X3"},
+            {record.title: record.game for record in records},
+        )
+        for stem in ("mmx", "mmx2", "mmx3"):
+            self.assert_installed(stem)
+
+    def test_the_filter_is_noted_for_review(self) -> None:
+        self.add_page("Mega Man X1", self.filtered("Mega Man X"))
+        records = self.crawl()
+        record = self.record_for(records, "Mega Man X1")
+        self.assertTrue(any("filters releases by 'Mega Man X'" in note for note in record.notes), record.notes)
+
+    def test_an_abbreviated_asset_name_is_reachable_through_the_filter(self) -> None:
+        # Without the filter "smw" is an abbreviation the matcher refuses to connect to the page.
+        self.add_page("Super Mario World", f"https://github.com/{self.REPO}")
+        refused = self.crawl()
+        self.assertEqual(OUTCOME_FAILED, self.record_for(refused, "Super Mario World").outcome)
+
+        self.pages.clear()
+        self.add_page("Super Mario World", self.filtered("smw"))
+        records = self.crawl(self.options(refresh=True))
+        record = self.record_for(records, "Super Mario World")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertEqual("smw.apworld", record.asset_name)
+
+    def test_an_unfiltered_link_still_needs_the_name_to_match(self) -> None:
+        self.add_page("Mega Man X1", f"https://github.com/{self.REPO}")
+        records = self.crawl()
+        record = self.record_for(records, "Mega Man X1")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertEqual("Mega Man X1", record.game)
+
+
 class TestArchiveMode(CrawlTestCase):
     """The same pipeline, but leaving the .apworld file intact instead of unpacking it."""
 

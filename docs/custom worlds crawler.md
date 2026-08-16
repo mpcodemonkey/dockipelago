@@ -69,7 +69,30 @@ release feed interleaves unrelated games. A page for ActRaiser can point at a re
 most recent releases are Rune Factory, Sonic Battle and Rune Factory again — "newest release with an
 `.apworld` in it" fetches the wrong game almost every time.
 
-So a repository is classified first. If every `.apworld` it publishes has the same name, it is a
+### When the link already says which releases apply
+
+Some pages link to a *filtered* releases page rather than the repository, which settles the question
+before any guessing starts:
+
+```
+https://github.com/TheLX5/Archipelago/releases?q="Mega+Man+X"&expanded=true
+```
+
+That `q=` is the maintainer's own answer about which releases belong to this game, and it beats
+anything inferred from a name. It is read off the URL and applied as a **hard filter** before
+ranking, so everything below only ever runs on what the filter left — and usually has nothing left
+to decide. Matching is on the normalised release title and tag, the way the GitHub page itself
+behaves, so `"Mega Man X"` finds both `Mega Man X1 v1.4` and `megamanx-1.4`.
+
+This also reaches worlds that name-matching alone would refuse: `smw.apworld` is an abbreviation the
+matcher cannot connect to a page called "Super Mario World", but a link filtered on `smw` finds it.
+
+A filter that matches nothing is treated as stale rather than as an answer — the releases were
+probably renamed — and the unfiltered feed is used instead, with a note.
+
+### Otherwise
+
+A repository is classified first. If every `.apworld` it publishes has the same name, it is a
 one-world repository and its newest release wins, whatever anything is called. If it publishes
 several, every release becomes a candidate and each is scored against the game the page is about:
 
@@ -86,6 +109,13 @@ suffixes and `_apworld` suffixes are all absorbed, so `ActRaiser`, `act_raiser` 
 `actraiser-v1.2.0` are one game while `sonic_battle` is plainly not. A shared fragment is not enough
 on its own: a short name buried inside a longer one scores low, because most of the longer name is
 then unaccounted for.
+
+Numbered series get special treatment, because `Mega Man X1` and `Mega Man X2` share every word that
+matters and would otherwise rate as nearly the same game. Version stamps are stripped first — without
+that, the `1` in `Mega Man X2 v1.1` makes it look like it contains the very token that should have
+singled out X1 — and then, when both names carry a series number and the numbers disagree, they are
+treated as different games no matter how much else matches. A number on only one side is left alone:
+a page called "Rune Factory" may well be describing "Rune Factory 5".
 
 **A multi-game repository with nothing matching yields nothing.** The page is reported as failed,
 naming the games the repository does publish, rather than installing a confident guess. That is the
@@ -310,8 +340,8 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
   asset; those need to be added by hand.
 - In a repository publishing several games, a world whose asset name shares nothing with the page —
   an abbreviation like `smw.apworld`, or a codename — is refused rather than guessed at. The run
-  reports which games that repository does publish, so the fix is either `--ignore-game-mismatch` or
-  pointing the page's link straight at the right release.
+  reports which games that repository does publish, so the fix is `--ignore-game-mismatch`, a
+  filtered `?q=` releases link on the wiki page, or pointing the link straight at the right release.
 - Only one world per page is installed unless `--all-assets` is passed.
 - The crawler does not evaluate whether a world is any good, only whether core can load it. A world
   that imports cleanly can still fail during generation.

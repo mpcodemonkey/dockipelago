@@ -77,6 +77,23 @@ class TestExtractFromWikitext(unittest.TestCase):
         assert candidate is not None
         self.assertEqual("https://github.com/owner/repo", candidate.url)
 
+    def test_a_filtered_releases_link_keeps_its_quoted_query(self) -> None:
+        # GitHub's own filtered-releases links contain quotes, and the query is the whole point.
+        url = 'https://github.com/TheLX5/Archipelago/releases?q="Mega+Man+X"&expanded=true'
+        candidate = extract_download_url(self._page(f"{{{{Infobox game| download = [{url} Download] }}}}"))
+        assert candidate is not None
+        self.assertEqual(url, candidate.url)
+
+    def test_a_quote_delimited_value_is_still_unwrapped(self) -> None:
+        candidate = extract_download_url(self._page('{{Infobox game| download = "https://github.com/o/r" }}'))
+        assert candidate is not None
+        self.assertEqual("https://github.com/o/r", candidate.url)
+
+    def test_italic_markup_around_a_link_is_stripped(self) -> None:
+        candidate = extract_download_url(self._page("{{Infobox game| download = ''https://github.com/o/r'' }}"))
+        assert candidate is not None
+        self.assertEqual("https://github.com/o/r", candidate.url)
+
     def test_non_infobox_template_is_lower_confidence(self) -> None:
         page = self._page("{{Game details| download = https://github.com/owner/repo }}")
         candidate = extract_download_url(page)

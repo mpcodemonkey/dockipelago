@@ -50,6 +50,8 @@ class GitHubTarget:
     tag: str | None = None
     asset_url: str | None = None
     asset_name: str | None = None
+    #: The ``?q=`` filter from a releases page, which the maintainer chose deliberately.
+    release_query: str = ""
 
     @property
     def slug(self) -> str:
@@ -166,7 +168,19 @@ def parse_github_url(url: str) -> GitHubTarget | None:
     if len(rest) >= 3 and rest[0] in ("blob", "raw") and rest[-1].lower().endswith(".apworld"):
         raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{'/'.join(rest[1:])}"
         return GitHubTarget(owner, repo, asset_url=raw_url, asset_name=rest[-1])
+    if rest[:1] == ["releases"]:
+        return GitHubTarget(owner, repo, release_query=_release_query(parts.query))
     return GitHubTarget(owner, repo)
+
+
+def _release_query(query_string: str) -> str:
+    """The ``q=`` term from a releases URL, e.g. ``?q="Mega+Man+X"&expanded=true``.
+
+    Surrounding quotes are dropped: GitHub uses them to force a phrase match, and matching here is
+    a phrase match either way.
+    """
+    values = urllib.parse.parse_qs(query_string).get("q") or []
+    return values[0].strip().strip('"\'') if values else ""
 
 
 def resolve_assets(
@@ -214,6 +228,7 @@ def resolve_assets(
     resolution = select_apworld_assets(
         releases,
         expected_game=expected_game or target.repo,
+        release_query=target.release_query,
         allow_prerelease=allow_prerelease,
         all_assets=all_assets,
         source=target.slug,
@@ -228,6 +243,7 @@ def select_apworld_assets(
     releases: Iterable[dict[str, Any]],
     *,
     expected_game: str = "",
+    release_query: str = "",
     allow_prerelease: bool = False,
     all_assets: bool = False,
     source: str = "",
@@ -239,6 +255,12 @@ def select_apworld_assets(
     There, every release is a candidate and the newest is usually the *wrong* game, so candidates
     are ranked by how well their asset name, release tag and release title match the game the page
     is about, and nothing is installed unless something actually matches.
+
+    ``release_query`` short-circuits most of that. When the wiki links to a filtered releases page -
+    ``/releases?q="Mega Man X"`` - the maintainer has already said which releases belong to this
+    game, and their answer beats anything guessed from a name. It is applied as a hard filter before
+    ranking, so the guessing that follows only ever runs on what the filter left behind, and usually
+    has nothing left to decide.
     """
     notes: list[str] = []
     usable = [release for release in releases if not release.get("draft")]
@@ -250,6 +272,7 @@ def select_apworld_assets(
         notes.append("only pre-releases available, using the newest one")
         ordered = usable
 
+    ordered = _apply_release_query(ordered, release_query, notes)
     candidates = _candidates(ordered, expected_game, source)
     if not candidates:
         return Resolution(notes=notes)
@@ -259,6 +282,14 @@ def select_apworld_assets(
 
     if multi_game:
         winner = _pick_from_multi_game_repo(candidates, expected_game, source, published_games, notes)
+        if winner is None and release_query:
+            # The link's own filter still narrowed this down, so trust it over a name that did not
+            # match: the newest release the maintainer pointed at is the best answer available.
+            winner = candidates[0]
+            notes.append(
+                f"nothing matched '{expected_game}' by name, using the newest release the link's "
+                f"'{release_query}' filter left"
+            )
         if winner is None:
             return Resolution(
                 notes=notes,
@@ -290,6 +321,36 @@ def select_apworld_assets(
         multi_game=multi_game,
         expected_game=expected_game,
     )
+
+
+def _apply_release_query(
+    releases: list[dict[str, Any]], release_query: str, notes: list[str]
+) -> list[dict[str, Any]]:
+    """Keep only the releases a ``?q=`` filter matches, the way the GitHub page the link points at does.
+
+    Matching is on the normalised release title and tag, so ``"Mega Man X"`` finds ``Mega Man X1
+    v1.2`` and ``megamanx-1.2`` alike. A filter that matches nothing is treated as stale rather than
+    as an answer - the releases were probably renamed - and the unfiltered feed is used instead.
+    """
+    if not release_query:
+        return releases
+
+    wanted = normalize(release_query)
+    if not wanted:
+        return releases
+
+    matching = [
+        release
+        for release in releases
+        if wanted in normalize(f"{release.get('name') or ''} {release.get('tag_name') or ''}")
+    ]
+    if not matching:
+        notes.append(f"the link filters releases by '{release_query}', but no release matches it any more")
+        return releases
+
+    if len(matching) != len(releases):
+        notes.append(f"the link filters releases by '{release_query}', leaving {len(matching)} of {len(releases)}")
+    return matching
 
 
 def _candidates(releases: Sequence[dict[str, Any]], expected_game: str, source: str) -> list[AssetCandidate]:

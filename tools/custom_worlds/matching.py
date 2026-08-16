@@ -48,15 +48,34 @@ MIN_MATCH_SCORE = 50
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _TOKEN_SPLIT = re.compile(r"[^a-z0-9]+|(?<=[a-z])(?=[0-9])|(?<=[0-9])(?=[a-z])")
 
+#: Version stamps, which say nothing about which game this is: "v1.2", "1.2.3", "v3", "-rc2".
+#: Only dotted numbers and v-prefixed ones count, so a bare trailing number - the "2" in
+#: "Mega Man X2" - survives as part of the name.
+_VERSION = re.compile(r"\bv\d+(?:\.\d+)*\b|\b\d+(?:\.\d+)+\b|\brc\d+\b", re.IGNORECASE)
+_SEPARATORS = re.compile(r"[_\-]+")
+
 
 def normalize(value: str) -> str:
     """Reduce a name to lower-case alphanumerics: ``"Act Raiser!"`` becomes ``"actraiser"``."""
     return _NON_ALNUM.sub("", value.lower())
 
 
+def strip_version(value: str) -> str:
+    """Drop version stamps, so ``"Mega Man X2 v1.1"`` compares as ``"Mega Man X2"``.
+
+    Without this the digits in a version leak into the comparison and every entry in a series looks
+    like every other one: "Mega Man X2 v1.1" appears to contain a "1", which is exactly the token
+    that should have singled out "Mega Man X1".
+    """
+    # Separators become spaces first: "_" is a word character, so without this the \b in the
+    # pattern never fires on the very common "mygame_v1.2" shape.
+    return _VERSION.sub(" ", _SEPARATORS.sub(" ", value))
+
+
 def tokenize(value: str) -> list[str]:
     """Split a name into meaningful words, keeping the stop words if that is all there is."""
-    parts = [part for part in _TOKEN_SPLIT.split(_split_camel_case(value).lower()) if part]
+    cleaned = _split_camel_case(strip_version(value)).lower()
+    parts = [part for part in _TOKEN_SPLIT.split(cleaned) if part]
     meaningful = [part for part in parts if part not in STOP_TOKENS]
     return meaningful or parts
 
@@ -68,10 +87,31 @@ def name_score(expected: str, value: str) -> int:
         return 0
     if normalized_expected == normalized_value:
         return 100
+
+    expected_tokens, value_tokens = tokenize(expected), tokenize(value)
+    if _different_entries_in_a_series(expected_tokens, value_tokens):
+        return 0
     return max(
-        _token_score(tokenize(expected), tokenize(value)),
+        _token_score(expected_tokens, value_tokens),
         _substring_score(normalized_expected, normalized_value),
     )
+
+
+def _different_entries_in_a_series(expected: list[str], value: list[str]) -> bool:
+    """Whether two names are numbered entries in the same series, but not the same entry.
+
+    "Mega Man X1" and "Mega Man X2" share almost every word, so overlap alone rates them as nearly
+    the same game. The number is the whole point of the name, and when both sides carry one and they
+    disagree, they are different games however much else matches. A number on only one side is left
+    alone: a page called "Rune Factory" may well be describing "Rune Factory 5".
+    """
+    expected_number, value_number = _series_number(expected), _series_number(value)
+    return expected_number is not None and value_number is not None and expected_number != value_number
+
+
+def _series_number(tokens: list[str]) -> str | None:
+    """The last purely numeric token, which is where a series number sits in these names."""
+    return next((token for token in reversed(tokens) if token.isdigit()), None)
 
 
 def matches(expected: str, value: str, *, threshold: int = MIN_MATCH_SCORE) -> bool:
