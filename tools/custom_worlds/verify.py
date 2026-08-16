@@ -38,6 +38,12 @@ STATUS_INVALID = "invalid"
 #: Statuses whose files are safe to keep in ``worlds/``.
 INSTALLABLE_STATUSES = frozenset({STATUS_OK, STATUS_WARNING})
 
+#: What to do about worlds that load but that WebHost.py would drop from the site.
+WEBHOST_ERROR = "error"
+WEBHOST_WARN = "warn"
+WEBHOST_OFF = "off"
+WEBHOST_POLICIES = (WEBHOST_ERROR, WEBHOST_WARN, WEBHOST_OFF)
+
 #: A file's status is the worst thing found in it.
 _SEVERITY = {STATUS_OK: 0, STATUS_WARNING: 1, STATUS_INCOMPATIBLE: 2, STATUS_INVALID: 3}
 
@@ -140,12 +146,15 @@ def parse_version(value: str) -> tuple[int, ...] | None:
         return None
 
 
-def verify_apworld(path: Path, versions: CoreVersions, *, require_webworld: bool = False) -> VerificationResult:
+def verify_apworld(
+    path: Path, versions: CoreVersions, *, webhost_check: str = WEBHOST_ERROR
+) -> VerificationResult:
     """Check that ``path`` is an apworld this Archipelago checkout can load.
 
-    ``require_webworld`` decides what to do about a world that never sets ``web``. Such a world does
-    load and generate, so it is a warning by default, but it breaks the WebHost's tutorial page for
-    the whole site - turn this on when the checkout exists to serve that site.
+    ``webhost_check`` decides what to do about a world that loads but that ``WebHost.py`` would drop
+    for having no ``web.tutorials``. Such a world still generates, so ``"warn"`` installs it anyway
+    and ``"off"`` ignores the question entirely; the default rejects it, because a world the WebHost
+    will not serve is dead weight in an image built to serve exactly that.
     """
     result = VerificationResult(path=path)
 
@@ -163,7 +172,7 @@ def verify_apworld(path: Path, versions: CoreVersions, *, require_webworld: bool
                 result.fail(STATUS_INVALID, f"corrupt entry in archive: {corrupt}")
                 return result
             _check_layout(archive, path, result)
-            _check_webworld(archive, path, result, require_webworld=require_webworld)
+            _check_webworld(archive, path, result, webhost_check=webhost_check)
             manifest_data = _read_manifest(archive, result)
     except zipfile.BadZipFile as error:
         result.fail(STATUS_INVALID, f"not a valid zip archive: {error}")
@@ -206,7 +215,7 @@ def _check_webworld(
     path: Path,
     result: VerificationResult,
     *,
-    require_webworld: bool,
+    webhost_check: str,
 ) -> None:
     """Read the world's ``__init__.py`` and report broken WebWorld wiring.
 
@@ -223,9 +232,11 @@ def _check_webworld(
         return
 
     for finding in inspect_source(source, module_name=path.stem):
-        if finding.fatal or require_webworld:
+        if finding.blocks_loading:
             result.fail(STATUS_INVALID, finding.detail)
-        else:
+        elif webhost_check == WEBHOST_ERROR:
+            result.fail(STATUS_INVALID, finding.detail)
+        elif webhost_check == WEBHOST_WARN:
             result.warn(finding.detail)
 
 

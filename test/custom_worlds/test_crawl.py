@@ -628,18 +628,27 @@ class TestSharedRepository(CrawlTestCase):
 
 
 class TestWebWorldRejection(CrawlTestCase):
-    """Worlds whose WebWorld wiring would break Archipelago never reach worlds/."""
+    """Worlds Archipelago cannot load, or the WebHost will not serve, never reach worlds/."""
 
     GOOD = (
-        "from worlds.AutoWorld import World, WebWorld\n"
-        "class MyGameWeb(WebWorld):\n    tutorials = []\n"
+        "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
+        "class MyGameWeb(WebWorld):\n"
+        '    setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n'
+        "    tutorials = [setup]\n"
         'class MyGameWorld(World):\n    game = "Some Game Game"\n    web = MyGameWeb()\n'
     )
     NOT_INSTANTIATED = GOOD.replace("web = MyGameWeb()", "web = MyGameWeb")
-    NO_WEB = (
-        "from worlds.AutoWorld import World\n"
-        'class MyGameWorld(World):\n    game = "Some Game Game"\n'
+    NO_TUTORIALS = GOOD.replace(
+        '    setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n    tutorials = [setup]\n',
+        '    theme = "grass"\n',
     )
+    COMMENTED_TUTORIALS = GOOD.replace(
+        '    setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n    tutorials = [setup]\n',
+        '    # setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n'
+        "    # tutorials = [setup]\n"
+        '    theme = "grass"\n',
+    )
+    NO_WEB = "from worlds.AutoWorld import World\n" + 'class MyGameWorld(World):\n    game = "Some Game Game"\n'
 
     def test_a_correctly_wired_world_installs(self) -> None:
         self.add_game("Some Game", init_source=self.GOOD)
@@ -656,38 +665,63 @@ class TestWebWorldRejection(CrawlTestCase):
         self.assert_not_installed("mygame")
         self.assertEqual([], self.lock["worlds"])
 
-    def test_a_missing_webworld_installs_with_a_warning(self) -> None:
-        self.add_game("Some Game", init_source=self.NO_WEB)
+    def test_a_webworld_without_tutorials_is_not_installed(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
         records = self.crawl()
         record = self.record_for(records, "Some Game")
-        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
-        self.assertTrue(any("never sets 'web'" in warning for warning in record.warnings), record.warnings)
-        self.assertEqual("warning", record.verification)
-        self.assert_installed("mygame")
-
-    def test_require_webworld_keeps_it_out(self) -> None:
-        self.add_game("Some Game", init_source=self.NO_WEB)
-        records = self.crawl(self.options(require_webworld=True))
-        record = self.record_for(records, "Some Game")
         self.assertEqual(OUTCOME_SKIPPED, record.outcome)
-        self.assertIn("never sets 'web'", record.reason)
+        self.assertIn("invalid for WebHost", record.reason)
         self.assert_not_installed("mygame")
 
-    def test_the_warning_is_recorded_in_the_lockfile(self) -> None:
+    def test_a_commented_out_tutorial_block_is_not_installed(self) -> None:
+        self.add_game("Some Game", init_source=self.COMMENTED_TUTORIALS)
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        # Reached via the tutorials check, not by the file failing to parse.
+        self.assertIn("defines no 'tutorials'", record.reason)
+        self.assert_not_installed("mygame")
+
+    def test_a_world_with_no_web_is_not_installed(self) -> None:
         self.add_game("Some Game", init_source=self.NO_WEB)
-        self.crawl()
-        entry = self.lock["worlds"][0]
-        self.assertEqual("warning", entry["verification"])
-        self.assertTrue(any("never sets 'web'" in warning for warning in entry["warnings"]))
+        records = self.crawl()
+        self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Some Game").outcome)
+        self.assert_not_installed("mygame")
+
+    def test_warn_installs_it_with_the_reason_recorded(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        records = self.crawl(self.options(webhost_check="warn"))
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assertTrue(any("invalid for WebHost" in warning for warning in record.warnings), record.warnings)
+        self.assertEqual("warning", record.verification)
+        self.assert_installed("mygame")
+        self.assertTrue(any("invalid for WebHost" in w for w in self.lock["worlds"][0]["warnings"]))
+
+    def test_off_installs_it_silently(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_TUTORIALS)
+        records = self.crawl(self.options(webhost_check="off"))
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome)
+        self.assertEqual([], record.warnings)
+
+    def test_no_policy_rescues_a_world_that_cannot_load(self) -> None:
+        self.add_game("Some Game", init_source=self.NOT_INSTANTIATED)
+        for policy in ("error", "warn", "off"):
+            records = self.crawl(self.options(webhost_check=policy, refresh=True))
+            self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Some Game").outcome, policy)
 
     def test_one_broken_world_does_not_stop_the_others(self) -> None:
         self.add_game("Good Game", repo="a/a", asset_name="good.apworld", init_source=self.GOOD)
         self.add_game("Bad Game", repo="b/b", asset_name="bad.apworld", init_source=self.NOT_INSTANTIATED)
+        self.add_game("Webless Game", repo="c/c", asset_name="webless.apworld", init_source=self.NO_TUTORIALS)
         records = self.crawl()
         self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Good Game").outcome)
         self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Bad Game").outcome)
+        self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Webless Game").outcome)
         self.assert_installed("good")
         self.assert_not_installed("bad")
+        self.assert_not_installed("webless")
 
 
 class TestArchiveMode(CrawlTestCase):

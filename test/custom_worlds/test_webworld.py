@@ -3,26 +3,32 @@
 The expected severities are not guesses: each was confirmed against this checkout by loading a world
 with that mistake in it. ``web = MyWeb`` raises ``AssertionError: WebWorld has to be instantiated.``,
 ``web = Missing()`` raises ``NameError``, and both leave the world unregistered; a world with no
-``web`` at all loads fine but its ``web.tutorials`` raises ``AttributeError``.
+``web`` at all, or one whose WebWorld has no ``tutorials``, loads fine but is dropped by
+``WebHost.py``, whose filter is literally ``hasattr(world.web, "tutorials")``.
 """
 
 import unittest
 from pathlib import Path
 
 from tools.custom_worlds.webworld import (
+    SEVERITY_LOAD,
+    SEVERITY_WEBHOST,
+    TUTORIALS_NOT_A_LIST,
     UNPARSEABLE,
     WEB_MISSING,
+    WEB_NO_TUTORIALS,
     WEB_NOT_INSTANTIATED,
     WEB_UNDEFINED,
     inspect_source,
 )
 
-WORLD_HEADER = "from worlds.AutoWorld import World, WebWorld\n"
+WORLD_HEADER = "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
+TUTORIALS = '    tutorials = [Tutorial(tutorial_name="Setup Guide", file_name="setup.md")]\n'
 
 
 def world(body: str, *, header: str = WORLD_HEADER, web_class: bool = True) -> str:
     """Assemble a plausible world module around ``body``, which becomes the World class body."""
-    web = "class MyGameWeb(WebWorld):\n    tutorials = []\n\n\n" if web_class else ""
+    web = f"class MyGameWeb(WebWorld):\n{TUTORIALS}\n\n" if web_class else ""
     indented = "\n".join(f"    {line}" if line else "" for line in body.strip().splitlines())
     return f'{header}\n\n{web}class MyGameWorld(World):\n    game = "My Game"\n{indented}\n'
 
@@ -41,14 +47,14 @@ class TestBrokenWiring(WebWorldTestCase):
     def test_assigning_the_class_instead_of_an_instance_is_fatal(self) -> None:
         finding = self.only(world("web = MyGameWeb"))
         self.assertEqual(WEB_NOT_INSTANTIATED, finding.code)  # type: ignore[attr-defined]
-        self.assertTrue(finding.fatal)  # type: ignore[attr-defined]
+        self.assertEqual(SEVERITY_LOAD, finding.severity)  # type: ignore[attr-defined]
         self.assertEqual("MyGameWorld", finding.world_class)  # type: ignore[attr-defined]
         self.assertIn("web = MyGameWeb()", finding.detail)  # type: ignore[attr-defined]
 
     def test_instantiating_a_name_that_does_not_exist_is_fatal(self) -> None:
         finding = self.only(world("web = MyGameWeb()", web_class=False))
         self.assertEqual(WEB_UNDEFINED, finding.code)  # type: ignore[attr-defined]
-        self.assertTrue(finding.fatal)  # type: ignore[attr-defined]
+        self.assertEqual(SEVERITY_LOAD, finding.severity)  # type: ignore[attr-defined]
 
     def test_assigning_a_name_that_does_not_exist_is_fatal(self) -> None:
         finding = self.only(world("web = some_web_instance", web_class=False))
@@ -57,8 +63,8 @@ class TestBrokenWiring(WebWorldTestCase):
     def test_a_world_with_no_web_is_reported_but_not_fatal(self) -> None:
         finding = self.only(world("options_dataclass = None", web_class=False))
         self.assertEqual(WEB_MISSING, finding.code)  # type: ignore[attr-defined]
-        self.assertFalse(finding.fatal)  # type: ignore[attr-defined]
-        self.assertIn("tutorials", finding.detail)  # type: ignore[attr-defined]
+        self.assertEqual(SEVERITY_WEBHOST, finding.severity)  # type: ignore[attr-defined]
+        self.assertIn("invalid for WebHost", finding.detail)  # type: ignore[attr-defined]
 
     def test_a_bare_annotation_declares_nothing(self) -> None:
         self.assertEqual([WEB_MISSING], self.codes(world("web: WebWorld", web_class=False)))
@@ -66,12 +72,12 @@ class TestBrokenWiring(WebWorldTestCase):
     def test_unparseable_source_is_fatal(self) -> None:
         finding = self.only("class MyGameWorld(World)\n    game = 'My Game'\n")
         self.assertEqual(UNPARSEABLE, finding.code)  # type: ignore[attr-defined]
-        self.assertTrue(finding.fatal)  # type: ignore[attr-defined]
+        self.assertEqual(SEVERITY_LOAD, finding.severity)  # type: ignore[attr-defined]
 
     def test_every_broken_world_in_a_file_is_reported(self) -> None:
         source = (
             WORLD_HEADER
-            + "\n\nclass MyGameWeb(WebWorld):\n    tutorials = []\n\n\n"
+            + "\n\nclass MyGameWeb(WebWorld):\n" + TUTORIALS + "\n\n"
             + 'class OneWorld(World):\n    game = "One"\n    web = MyGameWeb\n\n\n'
             + 'class TwoWorld(World):\n    game = "Two"\n'
         )
@@ -92,7 +98,7 @@ class TestCorrectWiring(WebWorldTestCase):
     def test_a_module_level_instance_is_clean(self) -> None:
         source = (
             WORLD_HEADER
-            + "\n\nclass MyGameWeb(WebWorld):\n    tutorials = []\n\n\n"
+            + "\n\nclass MyGameWeb(WebWorld):\n" + TUTORIALS + "\n\n"
             + "_web = MyGameWeb()\n\n\n"
             + 'class MyGameWorld(World):\n    game = "My Game"\n    web = _web\n'
         )
@@ -101,7 +107,7 @@ class TestCorrectWiring(WebWorldTestCase):
     def test_web_patched_on_after_the_class_body_is_clean(self) -> None:
         source = (
             WORLD_HEADER
-            + "\n\nclass MyGameWeb(WebWorld):\n    tutorials = []\n\n\n"
+            + "\n\nclass MyGameWeb(WebWorld):\n" + TUTORIALS + "\n\n"
             + 'class MyGameWorld(World):\n    game = "My Game"\n\n\n'
             + "MyGameWorld.web = MyGameWeb()\n"
         )
@@ -110,7 +116,7 @@ class TestCorrectWiring(WebWorldTestCase):
     def test_web_inherited_from_a_local_base_is_clean(self) -> None:
         source = (
             WORLD_HEADER
-            + "\n\nclass MyGameWeb(WebWorld):\n    tutorials = []\n\n\n"
+            + "\n\nclass MyGameWeb(WebWorld):\n" + TUTORIALS + "\n\n"
             + "class BaseWorld(World):\n    web = MyGameWeb()\n\n\n"
             + 'class MyGameWorld(BaseWorld):\n    game = "My Game"\n'
         )
@@ -120,7 +126,118 @@ class TestCorrectWiring(WebWorldTestCase):
         self.assertEqual([], self.codes("def helper():\n    return 1\n"))
 
     def test_a_webworld_subclass_alone_is_not_mistaken_for_a_world(self) -> None:
-        self.assertEqual([], self.codes(WORLD_HEADER + "\n\nclass MyGameWeb(WebWorld):\n    tutorials = []\n"))
+        self.assertEqual([], self.codes(WORLD_HEADER + "\n\nclass MyGameWeb(WebWorld):\n" + TUTORIALS))
+
+
+class TestTutorials(WebWorldTestCase):
+    """A WebWorld only counts for the WebHost once it carries a tutorials list."""
+
+    def build(self, web_body: str) -> str:
+        return (
+            WORLD_HEADER
+            + "\n\nclass MyGameWeb(WebWorld):\n"
+            + web_body
+            + '\n\nclass MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+
+    def test_a_full_tutorial_block_is_clean(self) -> None:
+        source = self.build(
+            "    setup = Tutorial(\n"
+            '        tutorial_name = "Setup Guide",\n'
+            '        description = "A guide to setting up the game",\n'
+            '        language = "English",\n'
+            '        file_name = "setup.md",\n'
+            '        link = "setup/en",\n'
+            '        authors = ["Someone"]\n'
+            "    )\n"
+            "    tutorials = [setup]\n"
+        )
+        self.assertEqual([], self.codes(source))
+
+    def test_a_webworld_without_tutorials_is_reported(self) -> None:
+        finding = self.only(self.build('    theme = "grass"\n'))
+        self.assertEqual(WEB_NO_TUTORIALS, finding.code)  # type: ignore[attr-defined]
+        self.assertEqual(SEVERITY_WEBHOST, finding.severity)  # type: ignore[attr-defined]
+        self.assertIn("invalid for WebHost", finding.detail)  # type: ignore[attr-defined]
+        self.assertIn("Tutorial", finding.detail)  # type: ignore[attr-defined]
+
+    def test_a_commented_out_tutorial_block_counts_as_absent(self) -> None:
+        # Parsing gives this for free: commented code is simply not in the tree.
+        source = self.build(
+            '    # setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n'
+            "    # tutorials = [setup]\n"
+            '    theme = "grass"\n'
+        )
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(source))
+
+    def test_a_bare_tutorials_annotation_counts_as_absent(self) -> None:
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(self.build("    tutorials: list\n")))
+
+    def test_an_empty_list_is_accepted_because_core_accepts_it(self) -> None:
+        # WebHost.py only asks hasattr(web, "tutorials"), so an empty list passes.
+        self.assertEqual([], self.codes(self.build("    tutorials = []\n")))
+
+    def test_a_lone_tutorial_without_brackets_is_reported(self) -> None:
+        source = self.build('    tutorials = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n')
+        finding = self.only(source)
+        self.assertEqual(TUTORIALS_NOT_A_LIST, finding.code)  # type: ignore[attr-defined]
+        self.assertEqual(SEVERITY_WEBHOST, finding.severity)  # type: ignore[attr-defined]
+
+    def test_a_string_is_reported(self) -> None:
+        self.assertEqual([TUTORIALS_NOT_A_LIST], self.codes(self.build('    tutorials = "setup"\n')))
+
+    def test_a_tuple_is_accepted(self) -> None:
+        self.assertEqual([], self.codes(self.build('    tutorials = (Tutorial(file_name="setup.md"),)\n')))
+
+    def test_a_module_level_list_is_accepted(self) -> None:
+        source = (
+            WORLD_HEADER
+            + '\n\n_tutorials = [Tutorial(file_name="setup.md")]\n\n\n'
+            + "class MyGameWeb(WebWorld):\n    tutorials = _tutorials\n\n\n"
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+        self.assertEqual([], self.codes(source))
+
+    def test_tutorials_from_a_factory_call_is_left_alone(self) -> None:
+        # build_tutorials() may well return a list; only a bare Tutorial(...) is provably wrong.
+        source = (
+            WORLD_HEADER
+            + "\n\ndef build_tutorials():\n    return []\n\n\n"
+            + "class MyGameWeb(WebWorld):\n    tutorials = build_tutorials()\n\n\n"
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+        self.assertEqual([], self.codes(source))
+
+    def test_tutorials_inherited_from_a_local_base_is_clean(self) -> None:
+        source = (
+            WORLD_HEADER
+            + "\n\nclass BaseWeb(WebWorld):\n" + TUTORIALS + "\n\n"
+            + 'class MyGameWeb(BaseWeb):\n    theme = "grass"\n\n\n'
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+        self.assertEqual([], self.codes(source))
+
+    def test_tutorials_inherited_from_an_unseen_base_is_clean(self) -> None:
+        source = (
+            WORLD_HEADER
+            + "from .common import SharedWeb\n\n\n"
+            + 'class MyGameWeb(SharedWeb):\n    theme = "grass"\n\n\n'
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+        self.assertEqual([], self.codes(source))
+
+    def test_tutorials_patched_on_after_the_class_is_clean(self) -> None:
+        source = (
+            WORLD_HEADER
+            + '\n\nclass MyGameWeb(WebWorld):\n    theme = "grass"\n\n\n'
+            + "MyGameWeb.tutorials = []\n\n\n"
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+        self.assertEqual([], self.codes(source))
+
+    def test_an_imported_webworld_is_not_checked_for_tutorials(self) -> None:
+        source = world("web = MyGameWeb()", header=WORLD_HEADER + "from .web import MyGameWeb\n", web_class=False)
+        self.assertEqual([], self.codes(source))
 
 
 class TestCrossModuleLayoutsAreLeftAlone(WebWorldTestCase):

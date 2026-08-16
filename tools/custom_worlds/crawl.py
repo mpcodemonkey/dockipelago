@@ -31,6 +31,8 @@ from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
 from .verify import (
     STATUS_OK,
+    WEBHOST_ERROR,
+    WEBHOST_POLICIES,
     CoreVersions,
     VerificationResult,
     detect_core_versions,
@@ -121,7 +123,7 @@ class CrawlOptions:
     prune: bool = False
     install_mode: str = INSTALL_EXTRACT
     ignore_game_mismatch: bool = False
-    require_webworld: bool = False
+    webhost_check: str = WEBHOST_ERROR
     max_asset_bytes: int = DEFAULT_MAX_ASSET_BYTES
 
 
@@ -270,7 +272,7 @@ class Crawler:
         staged.parent.mkdir(parents=True, exist_ok=True)
         staged.write_bytes(payload)
 
-        result = verify_apworld(staged, self.versions, require_webworld=self.options.require_webworld)
+        result = verify_apworld(staged, self.versions, webhost_check=self.options.webhost_check)
         record.verification = result.status
         record.errors.extend(result.errors)
         record.warnings.extend(result.warnings)
@@ -529,15 +531,15 @@ def log_summary(records: Sequence[GameRecord]) -> None:
         for record in sorted(guessed, key=lambda item: item.title.lower()):
             logger.info("  %s -> %s", record.title, record.download_url)
 
-    webworld = [
+    webhost = [
         record
         for record in records
-        if record.succeeded and any("never sets 'web'" in warning for warning in record.warnings)
+        if record.succeeded and any("invalid for WebHost" in warning for warning in record.warnings)
     ]
-    if webworld:
+    if webhost:
         logger.info("")
-        logger.info("Installed without a WebWorld, which breaks the WebHost tutorial page for the site:")
-        for record in sorted(webworld, key=lambda item: item.title.lower()):
+        logger.info("Installed but WebHost.py will drop these, so they will not appear on the site:")
+        for record in sorted(webhost, key=lambda item: item.title.lower()):
             logger.info("  %s (%s)", record.title, record.file or record.asset_name)
 
     shared = [record for record in records if record.succeeded and record.shared_repo and record.asset_name]
@@ -733,10 +735,11 @@ def build_parser() -> argparse.ArgumentParser:
         "'archive' drops the .apworld file in unchanged",
     )
     parser.add_argument(
-        "--require-webworld",
-        action="store_true",
-        help="refuse worlds that never set 'web'; they generate fine but break the WebHost "
-        "tutorial page for every game on the site",
+        "--webhost-check",
+        choices=WEBHOST_POLICIES,
+        default=WEBHOST_ERROR,
+        help="what to do about worlds that load but that WebHost.py drops for having no "
+        "web.tutorials: 'error' refuses them, 'warn' installs them anyway, 'off' skips the check",
     )
     parser.add_argument(
         "--ignore-game-mismatch",
@@ -793,7 +796,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prune=args.prune,
         install_mode=args.install_mode,
         ignore_game_mismatch=args.ignore_game_mismatch,
-        require_webworld=args.require_webworld,
+        webhost_check=args.webhost_check,
         max_asset_bytes=args.max_asset_bytes,
     )
 

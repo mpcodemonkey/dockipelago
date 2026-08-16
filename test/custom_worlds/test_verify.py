@@ -12,6 +12,9 @@ from tools.custom_worlds.verify import (
     STATUS_INVALID,
     STATUS_OK,
     STATUS_WARNING,
+    WEBHOST_ERROR,
+    WEBHOST_OFF,
+    WEBHOST_WARN,
     CoreVersions,
     VerificationResult,
     detect_core_versions,
@@ -205,15 +208,17 @@ class TestWebWorldChecks(ApworldTestCase):
     """The WebWorld analysis, reached through verify_apworld rather than directly."""
 
     GOOD = (
-        "from worlds.AutoWorld import World, WebWorld\n"
-        "class MyGameWeb(WebWorld):\n    tutorials = []\n"
+        "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
+        "class MyGameWeb(WebWorld):\n"
+        '    tutorials = [Tutorial(tutorial_name="Setup Guide", file_name="setup.md")]\n'
         'class MyGameWorld(World):\n    game = "Test Game"\n    web = MyGameWeb()\n'
     )
     NOT_INSTANTIATED = GOOD.replace("web = MyGameWeb()", "web = MyGameWeb")
-    NO_WEB = (
-        "from worlds.AutoWorld import World\n"
-        'class MyGameWorld(World):\n    game = "Test Game"\n'
+    NO_TUTORIALS = GOOD.replace(
+        '    tutorials = [Tutorial(tutorial_name="Setup Guide", file_name="setup.md")]\n',
+        '    theme = "grass"\n',
     )
+    NO_WEB = "from worlds.AutoWorld import World\n" + 'class MyGameWorld(World):\n    game = "Test Game"\n'
 
     def test_correct_wiring_passes(self) -> None:
         result = self.verify(manifest=default_manifest(), init_source=self.GOOD)
@@ -224,22 +229,6 @@ class TestWebWorldChecks(ApworldTestCase):
         self.assertEqual(STATUS_INVALID, result.status)
         self.assertFalse(result.installable)
         self.assertTrue(any("has to be instantiated" in error for error in result.errors), result.errors)
-
-    def test_a_missing_webworld_warns_by_default(self) -> None:
-        result = self.verify(manifest=default_manifest(), init_source=self.NO_WEB)
-        self.assertEqual(STATUS_WARNING, result.status)
-        self.assertTrue(result.installable)
-        self.assertTrue(any("never sets 'web'" in warning for warning in result.warnings), result.warnings)
-
-    def test_a_missing_webworld_can_be_made_fatal(self) -> None:
-        path = make_apworld(self.tmp / "mygame.apworld", manifest=default_manifest(), init_source=self.NO_WEB)
-        result = verify_apworld(path, VERSIONS, require_webworld=True)
-        self.assertEqual(STATUS_INVALID, result.status)
-        self.assertFalse(result.installable)
-
-    def test_require_webworld_does_not_disturb_a_correct_world(self) -> None:
-        path = make_apworld(self.tmp / "mygame.apworld", manifest=default_manifest(), init_source=self.GOOD)
-        self.assertEqual(STATUS_OK, verify_apworld(path, VERSIONS, require_webworld=True).status)
 
     def test_unparseable_source_is_invalid(self) -> None:
         result = self.verify(manifest=default_manifest(), init_source="class MyGameWorld(World)\n    pass\n")
@@ -263,6 +252,44 @@ class TestWebWorldChecks(ApworldTestCase):
         result = verify_apworld(path, VERSIONS)
         self.assertEqual(STATUS_WARNING, result.status)
         self.assertTrue(any("bytecode" in warning for warning in result.warnings))
+
+
+class TestWebHostPolicy(ApworldTestCase):
+    """What happens to worlds that load but that WebHost.py would drop from the site."""
+
+    def verify_with(self, source: str, policy: str) -> VerificationResult:
+        path = make_apworld(self.tmp / "mygame.apworld", manifest=default_manifest(), init_source=source)
+        return verify_apworld(path, VERSIONS, webhost_check=policy)
+
+    def test_no_tutorials_is_refused_by_default(self) -> None:
+        result = self.verify(manifest=default_manifest(), init_source=TestWebWorldChecks.NO_TUTORIALS)
+        self.assertEqual(STATUS_INVALID, result.status)
+        self.assertFalse(result.installable)
+        self.assertTrue(any("invalid for WebHost" in error for error in result.errors), result.errors)
+
+    def test_no_web_is_refused_by_default(self) -> None:
+        result = self.verify(manifest=default_manifest(), init_source=TestWebWorldChecks.NO_WEB)
+        self.assertEqual(STATUS_INVALID, result.status)
+
+    def test_warn_installs_it_anyway(self) -> None:
+        result = self.verify_with(TestWebWorldChecks.NO_TUTORIALS, WEBHOST_WARN)
+        self.assertEqual(STATUS_WARNING, result.status)
+        self.assertTrue(result.installable)
+        self.assertTrue(any("invalid for WebHost" in warning for warning in result.warnings))
+
+    def test_off_says_nothing_at_all(self) -> None:
+        result = self.verify_with(TestWebWorldChecks.NO_TUTORIALS, WEBHOST_OFF)
+        self.assertEqual(STATUS_OK, result.status, result.summary())
+        self.assertEqual([], result.warnings)
+
+    def test_the_policy_never_rescues_a_world_that_cannot_load(self) -> None:
+        for policy in (WEBHOST_ERROR, WEBHOST_WARN, WEBHOST_OFF):
+            result = self.verify_with(TestWebWorldChecks.NOT_INSTANTIATED, policy)
+            self.assertEqual(STATUS_INVALID, result.status, policy)
+
+    def test_a_correct_world_passes_under_every_policy(self) -> None:
+        for policy in (WEBHOST_ERROR, WEBHOST_WARN, WEBHOST_OFF):
+            self.assertEqual(STATUS_OK, self.verify_with(TestWebWorldChecks.GOOD, policy).status, policy)
 
 
 class TestFindConflicts(unittest.TestCase):

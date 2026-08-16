@@ -128,30 +128,68 @@ the checks follow the checkout rather than a hard-coded number.
 
 ### WebWorld wiring
 
-A world can satisfy every check above and still break Archipelago, because the manifest says nothing
-about the code. Two mistakes are common in community worlds, and both are read straight out of
-`<name>/__init__.py` with `ast` — the source is parsed, never imported:
+A world can satisfy every check above and still be useless here, because the manifest says nothing
+about the code. These are read straight out of `<name>/__init__.py` with `ast` — the source is
+parsed, never imported — and fall into two groups.
 
-| In the source | What Archipelago does | Verdict |
-| --- | --- | --- |
-| `web = MyGameWeb` — the class, not an instance | `AutoWorldRegister` asserts `isinstance(dct["web"], WebWorld)`, so the world raises `AssertionError: WebWorld has to be instantiated.` and never registers | **invalid** |
-| `web = MyGameWeb()` where `MyGameWeb` does not exist | `NameError` at import; the world never registers | **invalid** |
-| the file is not valid Python | `SyntaxError`, which aborts `import worlds` entirely rather than being caught per-world | **invalid** |
-| no `web` attribute at all | the world loads and generates fine, but inherits `World.web = WebWorld()`, whose `tutorials` is a bare annotation with no value | **warning** |
+**Archipelago will not load the world at all.** Always rejected:
 
-That last row is milder but has the wider blast radius: the WebHost's `/tutorial/` page loops over
-*every* registered world reading `world.web.tutorials`, so a single world without a `web` takes that
-page down for the whole site. It is a warning by default because the world is otherwise perfectly
-usable and this fork wants as many games as it can get; pass `--require-webworld` to keep those out
-too if a working tutorial index matters more.
+| In the source | What happens |
+| --- | --- |
+| `web = MyGameWeb` — the class, not an instance | `AutoWorldRegister` asserts `isinstance(dct["web"], WebWorld)`, so importing raises `AssertionError: WebWorld has to be instantiated.` |
+| `web = MyGameWeb()` where `MyGameWeb` does not exist | `NameError` at import |
+| the file is not valid Python | `SyntaxError`, which aborts `import worlds` entirely rather than being caught per-world |
+
+**The world loads, but the WebHost drops it.** `WebHost.py` filters its world list with
+`hasattr(world.web, "tutorials")`, logs
+
+```
+Following worlds not loaded as they are invalid for WebHost: {'Some Game'}
+```
+
+and removes the world from both `AutoWorldRegister.world_types` and the network data package — so
+the game does not appear on the site at all. Two shapes fail it:
+
+| In the source | Why |
+| --- | --- |
+| no `web` attribute | the world inherits `World.web = WebWorld()`, and the base `WebWorld` declares `tutorials` as a bare annotation with no value |
+| a `WebWorld` with no `tutorials` | same outcome, one level down |
+
+A valid WebWorld therefore needs a tutorial block:
+
+```python
+class MyGameWeb(WebWorld):
+    setup = Tutorial(
+        tutorial_name="Setup Guide",
+        description="A guide to setting up the game",
+        language="English",
+        file_name="setup.md",
+        link="setup/en",
+        authors=["Someone"],
+    )
+    tutorials = [setup]
+```
+
+Because the source is parsed rather than read, a commented-out `tutorials` block is indistinguishable
+from one that was never written — which is the right answer, since that is exactly how Python sees it
+too. `tutorials = []` is accepted, because core accepts it. `tutorials = Tutorial(...)` without the
+brackets is rejected, since the WebHost iterates the attribute.
+
+These are refused by default: a world the WebHost will not serve is dead weight in an image built to
+serve exactly that. `--webhost-check warn` installs them anyway and lists them at the end of the run,
+and `--webhost-check off` skips the question entirely. Neither setting can rescue a world from the
+first group.
 
 **Only `<name>/__init__.py` is inspected, and only provable problems are reported.** A world that
 keeps its `WebWorld` in a separate module — `web = MyGameWeb()` with `MyGameWeb` imported — is left
-alone, as are worlds that inherit `web` from a base class this file cannot see, assign an instance
-built at module level, or set `MyGameWorld.web` after the class body. Confirming those would mean
-resolving imports across the archive; staying quiet is the deliberate choice. As a check on that,
-the test suite runs the analysis over every world bundled with Archipelago and requires zero
-findings.
+alone, as are worlds that inherit `web` or `tutorials` from a base class this file cannot see, assign
+an instance built at module level, set `MyGameWorld.web` after the class body, or build their
+tutorials from a function call. Confirming those would mean resolving imports across the archive;
+staying quiet is the deliberate choice, since a false positive costs a game.
+
+As a standing check on that, the test suite runs the analysis over every world bundled with
+Archipelago and requires zero findings — and 80 of those 82 worlds reach the `tutorials` check
+rather than being skipped, so the guarantee is about precision, not silence.
 
 Two more checks only make sense once several worlds are installed together, and skip both sides when
 they fire:
@@ -205,7 +243,7 @@ the games that failed and why.
 | `--output custom_worlds` | install somewhere other than `worlds/` |
 | `--allow-prerelease` | accept pre-release GitHub releases |
 | `--ignore-game-mismatch` | install even when the manifest names a different game than the page |
-| `--require-webworld` | also refuse worlds that never set `web` |
+| `--webhost-check {error,warn,off}` | what to do about worlds the WebHost would drop (default `error`) |
 | `--recursive` | descend into subcategories |
 | `--strict` | exit non-zero if any game failed |
 | `--keep-staging DIR` | keep the downloaded files for inspection |
