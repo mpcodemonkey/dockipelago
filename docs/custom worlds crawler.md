@@ -213,16 +213,27 @@ first group.
 Refusing them also means **taking back out** any copy an earlier run installed — see
 [Rejected worlds](#rejected-worlds) below.
 
-**Only `<name>/__init__.py` is inspected, and only provable problems are reported.** A world that
-keeps its `WebWorld` in a separate module — `web = MyGameWeb()` with `MyGameWeb` imported — is left
-alone, as are worlds that inherit `web` or `tutorials` from a base class this file cannot see, assign
-an instance built at module level, set `MyGameWorld.web` after the class body, or build their
-tutorials from a function call. Confirming those would mean resolving imports across the archive;
-staying quiet is the deliberate choice, since a false positive costs a game.
+### The whole world is read, not just `__init__.py`
 
-As a standing check on that, the test suite runs the analysis over every world bundled with
-Archipelago and requires zero findings — and 80 of those 82 worlds reach the `tutorials` check
-rather than being skipped, so the guarantee is about precision, not silence.
+Splitting `World` and `WebWorld` across modules is normal — `from .web import MyGameWeb` — and a
+one-file analysis cannot see whether the `tutorials` list on the other side exists. An apworld
+carries its entire package, so relative imports are followed inside it:
+
+- modules reachable from `__init__` are scanned for `World` subclasses, so a world whose class lives
+  in `world.py` (or arrives via `from .world import *`) is still found;
+- `web = MyGameWeb()` resolves across modules, and the `WebWorld` it names is checked wherever it
+  lives, including through base classes in yet another module;
+- subpackages are followed too, so `from .sub.web import MyGameWeb` works.
+
+**Only provable problems are reported.** Names imported from outside the world, base classes in
+another package, `tutorials` built by a function call, an instance built at module level, and
+`MyGameWorld.web` patched on after the class body all stay quiet, because a false positive costs a
+game. So does a module the world never imports: dead code cannot register a class, so a broken
+`World` sitting in one is not a problem.
+
+As a standing check, the test suite runs the analysis over every world bundled with Archipelago —
+1771 modules across 82 worlds — and requires zero findings. 81 of those worlds reach the `tutorials`
+check rather than being skipped, so the guarantee is about precision, not silence.
 
 Two more checks only make sense once several worlds are installed together, and skip both sides when
 they fire:
@@ -345,9 +356,9 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 - Only one world per page is installed unless `--all-assets` is passed.
 - The crawler does not evaluate whether a world is any good, only whether core can load it. A world
   that imports cleanly can still fail during generation.
-- The WebWorld analysis only reads `<name>/__init__.py`. A world that splits its `WebWorld` into
-  another module is not checked at all, so a broken one of those still gets through — use
-  `--import-check` to catch it.
+- The WebWorld analysis follows imports inside the apworld, but stops at its edge. A world whose
+  `WebWorld` comes from another package, or is built at runtime rather than declared, is not judged
+  — use `--import-check` to catch those.
 
 ## Tests
 

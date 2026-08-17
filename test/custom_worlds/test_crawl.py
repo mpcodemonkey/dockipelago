@@ -1047,6 +1047,53 @@ class TestFilteredReleasesLink(CrawlTestCase):
         self.assertEqual("Mega Man X1", record.game)
 
 
+class TestMultiModuleWorlds(CrawlTestCase):
+    """Worlds that keep their WebWorld in a separate module, which one file cannot judge."""
+
+    WORLD_INIT = (
+        "from worlds.AutoWorld import World\n"
+        "from .web import GameWeb\n"
+        'class GameWorld(World):\n    game = "Some Game Game"\n    web = GameWeb()\n'
+    )
+    NO_TUTORIALS = 'from worlds.AutoWorld import WebWorld\nclass GameWeb(WebWorld):\n    theme = "grass"\n'
+    WITH_TUTORIALS = (
+        "from worlds.AutoWorld import WebWorld\n"
+        "from BaseClasses import Tutorial\n"
+        'class GameWeb(WebWorld):\n    tutorials = [Tutorial("Setup", "d", "en", "s.md", "s/en", ["me"])]\n'
+    )
+
+    def add_split_game(self, web_source: str) -> None:
+        self.add_game("Some Game", init_source=self.WORLD_INIT)
+        # Rebuild the apworld with the extra module the World imports.
+        make_apworld(
+            self.assets / "mygame.apworld",
+            module="mygame",
+            manifest=default_manifest("Some Game Game"),
+            init_source=self.WORLD_INIT,
+            extra_files={"mygame/web.py": web_source},
+        )
+
+    def test_a_split_world_without_tutorials_is_refused(self) -> None:
+        self.add_split_game(self.NO_TUTORIALS)
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("invalid for WebHost", record.reason)
+        self.assert_not_installed("mygame")
+
+    def test_a_split_world_with_tutorials_installs(self) -> None:
+        self.add_split_game(self.WITH_TUTORIALS)
+        records = self.crawl()
+        record = self.record_for(records, "Some Game")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assert_installed("mygame")
+
+    def test_the_extra_module_survives_installation(self) -> None:
+        self.add_split_game(self.WITH_TUTORIALS)
+        self.crawl()
+        self.assertTrue((self.world_path("mygame") / "web.py").is_file())
+
+
 class TestArchiveMode(CrawlTestCase):
     """The same pipeline, but leaving the .apworld file intact instead of unpacking it."""
 

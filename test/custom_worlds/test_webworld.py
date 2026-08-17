@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from tools.custom_worlds.webworld import (
+    ROOT,
     SEVERITY_LOAD,
     SEVERITY_WEBHOST,
     TUTORIALS_NOT_A_LIST,
@@ -20,6 +21,8 @@ from tools.custom_worlds.webworld import (
     WEB_NOT_INSTANTIATED,
     WEB_UNDEFINED,
     inspect_source,
+    inspect_world,
+    module_path,
 )
 
 WORLD_HEADER = "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
@@ -281,6 +284,125 @@ class TestCrossModuleLayoutsAreLeftAlone(WebWorldTestCase):
         self.assertEqual([], self.codes(source))
 
 
+class TestModulePath(unittest.TestCase):
+    def test_init_is_the_package_root(self) -> None:
+        self.assertEqual(ROOT, module_path("__init__.py"))
+
+    def test_a_sibling_module(self) -> None:
+        self.assertEqual("web", module_path("web.py"))
+
+    def test_a_subpackage(self) -> None:
+        self.assertEqual("sub", module_path("sub/__init__.py"))
+        self.assertEqual("sub.web", module_path("sub/web.py"))
+
+    def test_non_python_files_are_not_modules(self) -> None:
+        self.assertIsNone(module_path("archipelago.json"))
+        self.assertIsNone(module_path("docs/setup_en.md"))
+
+
+class TestAcrossModules(unittest.TestCase):
+    """Worlds that split World and WebWorld across files, which is most non-trivial ones.
+
+    Each layout here was confirmed against this checkout: with tutorials the world is served, and
+    without them WebHost.py drops it, exactly as the findings say.
+    """
+
+    NO_TUTORIALS = 'from worlds.AutoWorld import WebWorld\nclass GameWeb(WebWorld):\n    theme = "grass"\n'
+    WITH_TUTORIALS = (
+        "from worlds.AutoWorld import WebWorld\n"
+        "from BaseClasses import Tutorial\n"
+        'class GameWeb(WebWorld):\n    tutorials = [Tutorial("Setup", "d", "en", "s.md", "s/en", ["me"])]\n'
+    )
+
+    def codes(self, modules: dict[str, str]) -> list[str]:
+        return [finding.code for finding in inspect_world(modules, module_name="mygame")]
+
+    def test_a_webworld_in_another_module_is_checked(self) -> None:
+        modules = {
+            ROOT: 'from worlds.AutoWorld import World\nfrom .web import GameWeb\n'
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+            "web": self.NO_TUTORIALS,
+        }
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(modules))
+        modules["web"] = self.WITH_TUTORIALS
+        self.assertEqual([], self.codes(modules))
+
+    def test_a_world_class_in_another_module_is_found(self) -> None:
+        modules = {
+            ROOT: "from .world import GameWorld\n",
+            "world": 'from worlds.AutoWorld import World, WebWorld\nclass GameWeb(WebWorld):\n    theme = "g"\n'
+                     'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+        }
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(modules))
+
+    def test_a_star_imported_world_module_is_found(self) -> None:
+        modules = {
+            ROOT: "from .world import *\n",
+            "world": 'from worlds.AutoWorld import World, WebWorld\nclass GameWeb(WebWorld):\n    theme = "g"\n'
+                     'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+        }
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(modules))
+
+    def test_a_webworld_base_in_another_module_is_followed(self) -> None:
+        modules = {
+            ROOT: 'from worlds.AutoWorld import World\nfrom .base import BaseWeb\n'
+                  'class GameWeb(BaseWeb):\n    theme = "g"\n'
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+            "base": "from worlds.AutoWorld import WebWorld\nclass BaseWeb(WebWorld):\n    pass\n",
+        }
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(modules))
+
+        modules["base"] = (
+            "from worlds.AutoWorld import WebWorld\nfrom BaseClasses import Tutorial\n"
+            'class BaseWeb(WebWorld):\n    tutorials = [Tutorial("S", "d", "en", "s.md", "s/en", ["m"])]\n'
+        )
+        self.assertEqual([], self.codes(modules))
+
+    def test_a_nested_package_is_followed(self) -> None:
+        modules = {
+            ROOT: 'from worlds.AutoWorld import World\nfrom .sub.web import GameWeb\n'
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+            "sub": "",
+            "sub.web": self.NO_TUTORIALS,
+        }
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(modules))
+
+    def test_an_import_from_outside_the_world_stays_quiet(self) -> None:
+        modules = {
+            ROOT: "from worlds.AutoWorld import World\nfrom some_other_package import GameWeb\n"
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+        }
+        self.assertEqual([], self.codes(modules))
+
+    def test_a_module_the_world_never_imports_is_ignored(self) -> None:
+        # Dead code cannot register a class, so a broken world in it is not a problem.
+        modules = {
+            ROOT: "from worlds.AutoWorld import World, WebWorld\nfrom BaseClasses import Tutorial\n"
+                  'class GameWeb(WebWorld):\n    tutorials = [Tutorial("S", "d", "en", "s.md", "s/en", ["m"])]\n'
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+            "old_unused": 'from worlds.AutoWorld import World\nclass Dead(World):\n    game = "Dead"\n',
+        }
+        self.assertEqual([], self.codes(modules))
+
+    def test_a_star_import_from_outside_silences_undefined_names(self) -> None:
+        modules = {
+            ROOT: "from worlds.AutoWorld import World\nfrom some_other_package import *\n"
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+        }
+        self.assertEqual([], self.codes(modules))
+
+    def test_a_world_with_no_init_module_is_ignored(self) -> None:
+        self.assertEqual([], self.codes({"web": self.NO_TUTORIALS}))
+
+    def test_a_broken_sibling_module_does_not_derail_the_check(self) -> None:
+        modules = {
+            ROOT: 'from worlds.AutoWorld import World\nfrom .web import GameWeb\n'
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+            "web": "class GameWeb(WebWorld)\n    broken\n",
+        }
+        self.assertEqual([], self.codes(modules))
+
+
 class TestAgainstTheBundledWorlds(unittest.TestCase):
     """Every world shipped with Archipelago should pass, which is the false-positive check."""
 
@@ -288,16 +410,28 @@ class TestAgainstTheBundledWorlds(unittest.TestCase):
         root = Path(__file__).resolve().parents[2] / "worlds"
         inspected = 0
         problems: dict[str, list[str]] = {}
-        for init in sorted(root.glob("*/__init__.py")):
-            name = init.parent.name
-            if name.startswith(("_", ".")):
+        for world_dir in sorted(root.iterdir()):
+            name = world_dir.name
+            if not world_dir.is_dir() or name.startswith(("_", ".")):
+                continue
+            if not (world_dir / "__init__.py").exists():
                 continue
             inspected += 1
-            findings = inspect_source(init.read_text(encoding="utf-8", errors="replace"), module_name=name)
+            findings = inspect_world(_package_of(world_dir), module_name=name)
             if findings:
                 problems[name] = [finding.code for finding in findings]
         self.assertGreater(inspected, 20, "expected to find the bundled worlds")
         self.assertEqual({}, problems)
+
+
+def _package_of(world_dir: Path) -> dict[str, str]:
+    """Every Python module of a world on disk, keyed the way inspect_world expects."""
+    modules: dict[str, str] = {}
+    for source in world_dir.rglob("*.py"):
+        dotted = module_path(source.relative_to(world_dir).as_posix())
+        if dotted is not None and source.stat().st_size <= 2 * 1024 * 1024:
+            modules[dotted] = source.read_text(encoding="utf-8", errors="replace")
+    return modules
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from .webworld import inspect_source
+from .webworld import inspect_world, module_path
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,10 @@ WEBHOST_ERROR = "error"
 WEBHOST_WARN = "warn"
 WEBHOST_OFF = "off"
 WEBHOST_POLICIES = (WEBHOST_ERROR, WEBHOST_WARN, WEBHOST_OFF)
+
+#: Caps on how much source the WebWorld analysis will read out of one apworld.
+MAX_MODULE_BYTES = 2 * 1024 * 1024
+MAX_SOURCE_BYTES = 16 * 1024 * 1024
 
 #: A file's status is the worst thing found in it.
 _SEVERITY = {STATUS_OK: 0, STATUS_WARNING: 1, STATUS_INCOMPATIBLE: 2, STATUS_INVALID: 3}
@@ -219,27 +223,48 @@ def _check_webworld(
     *,
     webhost_check: str,
 ) -> None:
-    """Read the world's ``__init__.py`` and report broken WebWorld wiring.
+    """Read the world's Python modules and report broken WebWorld wiring.
 
-    Only ``<stem>/__init__.py`` is looked at: a world that keeps its WebWorld in a separate module
-    cannot be judged from here, and :mod:`.webworld` stays quiet rather than guessing.
+    The whole package is handed over, not just ``__init__.py``: worlds routinely keep their
+    ``WebWorld`` in a separate module, and only the package as a whole says whether a ``tutorials``
+    list exists anywhere.
     """
-    entry = f"{path.stem}/__init__.py"
-    try:
-        source = archive.read(entry).decode("utf-8", errors="replace")
-    except KeyError:
+    prefix = f"{path.stem}/"
+    if f"{prefix}__init__.py" not in archive.namelist():
         return  # _check_layout has already reported this
+
+    try:
+        modules = _read_modules(archive, prefix)
     except (OSError, zipfile.BadZipFile) as error:
-        result.fail(STATUS_INVALID, f"could not read {entry}: {error}")
+        result.fail(STATUS_INVALID, f"could not read the modules of {path.name}: {error}")
         return
 
-    for finding in inspect_source(source, module_name=path.stem):
+    for finding in inspect_world(modules, module_name=path.stem):
         if finding.blocks_loading or webhost_check == WEBHOST_ERROR:
             result.codes.append(finding.code)
             result.fail(STATUS_INVALID, finding.detail)
         elif webhost_check == WEBHOST_WARN:
             result.codes.append(finding.code)
             result.warn(finding.detail)
+
+
+def _read_modules(archive: zipfile.ZipFile, prefix: str) -> dict[str, str]:
+    """Every Python module in the world folder, keyed by dotted module path.
+
+    Reading is capped: a world that ships an enormous generated data module has nothing to say about
+    its WebWorld, and the analysis should not be the reason a run slows to a crawl.
+    """
+    modules: dict[str, str] = {}
+    budget = MAX_SOURCE_BYTES
+    for info in archive.infolist():
+        if info.is_dir() or not info.filename.startswith(prefix):
+            continue
+        dotted = module_path(info.filename[len(prefix):])
+        if dotted is None or info.file_size > MAX_MODULE_BYTES or info.file_size > budget:
+            continue
+        modules[dotted] = archive.read(info).decode("utf-8", errors="replace")
+        budget -= info.file_size
+    return modules
 
 
 def _read_manifest(archive: zipfile.ZipFile, result: VerificationResult) -> bytes | None:

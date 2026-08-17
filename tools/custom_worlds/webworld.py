@@ -19,18 +19,24 @@ loading a world with the mistake in it:
     ``World.web = WebWorld()``, whose ``tutorials`` is a bare annotation with no value), and a
     ``WebWorld`` subclass that never sets ``tutorials``.
 
-The source is read with :mod:`ast` rather than imported, since importing is what we are trying to
+The whole world is inspected, not just its ``__init__.py``. Custom worlds routinely split the
+``World`` and ``WebWorld`` classes across modules, and an analysis of one file cannot see a
+``tutorials`` list that lives in ``web.py`` - or the lack of one. Since an apworld carries its
+entire package, relative imports are followed inside it: modules reachable from ``__init__`` are
+scanned for ``World`` subclasses, and names are resolved across those modules.
+
+Everything is read with :mod:`ast` rather than imported, since importing is what we are trying to
 avoid doing to unverified third-party code. Parsing also settles the "is it commented out?" question
 for free: commented code is not in the tree, so a ``tutorials`` block behind a ``#`` reads exactly
 like one that was never written.
 
-Only ``<name>/__init__.py`` is inspected. A world that defines its ``WebWorld`` in another module is
-deliberately left alone, because confirming it would mean resolving imports across the archive. The
-rule throughout is to report a problem only when the source proves one, and stay quiet whenever the
-answer depends on something this module cannot see.
+Only modules the world actually reaches are considered, and only problems the source proves are
+reported. A name imported from outside the world, a base class in another package, a ``tutorials``
+list built by a function - all of these stay quiet, because a false positive costs a game.
 """
 
 import ast
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 #: Archipelago will not load the world at all.
@@ -51,11 +57,13 @@ WEB_NO_TUTORIALS = "web-no-tutorials"
 #: ``tutorials`` is set to something the WebHost cannot iterate over.
 TUTORIALS_NOT_A_LIST = "tutorials-not-a-list"
 
+ROOT = ""  # the world package itself, i.e. <name>/__init__.py
+
 _WORLD_BASE = "World"
 _WEBWORLD_BASE = "WebWorld"
 _TUTORIALS = "tutorials"
 _WEB = "web"
-_MAX_BASE_DEPTH = 10
+_MAX_DEPTH = 10
 
 _DROPPED_BY_WEBHOST = (
     "so WebHost.py drops it with 'Following worlds not loaded as they are invalid for WebHost' "
@@ -81,12 +89,39 @@ class WebWorldFinding:
         return self.detail
 
 
+def module_path(file_name: str) -> str | None:
+    """Turn a path inside the world folder into a dotted module path.
+
+    ``__init__.py`` is the package root and becomes ``""``; ``web.py`` becomes ``"web"``;
+    ``sub/__init__.py`` becomes ``"sub"``. Anything that is not Python is not a module.
+    """
+    if not file_name.endswith(".py"):
+        return None
+    stem = file_name[: -len(".py")]
+    parts = [part for part in stem.split("/") if part]
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
 def inspect_source(source: str, *, module_name: str = "") -> list[WebWorldFinding]:
-    """Report WebWorld problems provable from the text of a world's ``__init__.py``."""
+    """Inspect a world consisting of a single ``__init__.py``."""
+    return inspect_world({ROOT: source}, module_name=module_name)
+
+
+def inspect_world(modules: Mapping[str, str], *, module_name: str = "") -> list[WebWorldFinding]:
+    """Report WebWorld problems provable from a world's source.
+
+    ``modules`` maps dotted module paths - as produced by :func:`module_path` - to their source.
+    """
     label = module_name or "the world"
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as error:
+    package = _Package(modules)
+
+    if ROOT not in modules:
+        return []
+    root = package.index(ROOT)
+    if root is None:
+        error = package.errors[ROOT]
         return [
             WebWorldFinding(
                 code=UNPARSEABLE,
@@ -95,64 +130,62 @@ def inspect_source(source: str, *, module_name: str = "") -> list[WebWorldFindin
             )
         ]
 
-    module = _ModuleIndex(tree)
     findings: list[WebWorldFinding] = []
-    for name, node in module.classes.items():
-        if not module.is_world(name):
-            continue
-        finding = _check_world(name, node, module)
+    for path, name, node in package.world_classes():
+        finding = _check_world(path, name, node, package)
         if finding is not None:
             findings.append(finding)
     return findings
 
 
-def _check_world(name: str, node: ast.ClassDef, module: "_ModuleIndex") -> WebWorldFinding | None:
-    found, value = module.find_attribute(name, node, _WEB)
+def _check_world(path: str, name: str, node: ast.ClassDef, package: "_Package") -> WebWorldFinding | None:
+    found = package.find_attribute(path, node, _WEB)
 
-    if not found or value is None:
-        return _check_missing_web(name, module)
+    if found is None or found.value is None:
+        return _check_missing_web(path, name, node, package)
 
+    value, owner = found.value, found.module
     if isinstance(value, ast.Call):
-        root = _root_name_of(value.func)
-        if root and module.is_unknown(root):
-            callee = _name_of(value.func) or root
+        root_name = _root_name_of(value.func)
+        if root_name and package.is_unknown(owner, root_name):
+            callee = _name_of(value.func) or root_name
             return WebWorldFinding(
                 code=WEB_UNDEFINED,
-                detail=f"{name} sets web = {callee}(), but {root} is never defined or imported",
+                detail=f"{name} sets web = {callee}(), but {root_name} is never defined or imported",
                 severity=SEVERITY_LOAD,
                 world_class=name,
             )
-        # The WebWorld is only checkable when its class lives in this file.
-        web_name = _name_of(value.func)
-        webworld = module.classes.get(web_name) if web_name else None
-        if webworld is not None and web_name is not None:
-            return _check_tutorials(name, web_name, webworld, module)
+        webworld = package.class_def(owner, _name_of(value.func) or "")
+        if webworld is not None:
+            return _check_tutorials(name, webworld, package)
         return None
 
-    if isinstance(value, ast.Name) and value.id in module.classes:
-        return WebWorldFinding(
-            code=WEB_NOT_INSTANTIATED,
-            detail=(
-                f"{name} sets web = {value.id} instead of web = {value.id}(); core asserts "
-                "'WebWorld has to be instantiated.' and the world will not load"
-            ),
-            severity=SEVERITY_LOAD,
-            world_class=name,
-        )
-
-    if isinstance(value, ast.Name) and module.is_unknown(value.id):
-        return WebWorldFinding(
-            code=WEB_UNDEFINED,
-            detail=f"{name} sets web = {value.id}, but {value.id} is never defined or imported",
-            severity=SEVERITY_LOAD,
-            world_class=name,
-        )
+    if isinstance(value, ast.Name):
+        if package.class_def(owner, value.id) is not None and value.id not in package.instances(owner):
+            return WebWorldFinding(
+                code=WEB_NOT_INSTANTIATED,
+                detail=(
+                    f"{name} sets web = {value.id} instead of web = {value.id}(); core asserts "
+                    "'WebWorld has to be instantiated.' and the world will not load"
+                ),
+                severity=SEVERITY_LOAD,
+                world_class=name,
+            )
+        if package.is_unknown(owner, value.id):
+            return WebWorldFinding(
+                code=WEB_UNDEFINED,
+                detail=f"{name} sets web = {value.id}, but {value.id} is never defined or imported",
+                severity=SEVERITY_LOAD,
+                world_class=name,
+            )
 
     return None
 
 
-def _check_missing_web(name: str, module: "_ModuleIndex") -> WebWorldFinding | None:
-    if module.patches_attribute(name, _WEB) or module.inherits_from_outside(name):
+def _check_missing_web(
+    path: str, name: str, node: ast.ClassDef, package: "_Package"
+) -> WebWorldFinding | None:
+    if package.patches_attribute(path, name, _WEB) or package.inherits_from_outside(path, node):
         return None
     return WebWorldFinding(
         code=WEB_MISSING,
@@ -165,14 +198,15 @@ def _check_missing_web(name: str, module: "_ModuleIndex") -> WebWorldFinding | N
     )
 
 
-def _check_tutorials(
-    world_name: str, web_name: str, webworld: ast.ClassDef, module: "_ModuleIndex"
-) -> WebWorldFinding | None:
+def _check_tutorials(world_name: str, webworld: "_Class", package: "_Package") -> WebWorldFinding | None:
     """A WebWorld is only valid for the WebHost once it carries a ``tutorials`` list."""
-    found, value = module.find_attribute(web_name, webworld, _TUTORIALS)
+    found = package.find_attribute(webworld.module, webworld.node, _TUTORIALS)
+    web_name = webworld.name
 
-    if not found or value is None:
-        if module.patches_attribute(web_name, _TUTORIALS) or module.inherits_from_outside(web_name):
+    if found is None or found.value is None:
+        if package.patches_attribute(webworld.module, web_name, _TUTORIALS) or package.inherits_from_outside(
+            webworld.module, webworld.node
+        ):
             return None
         return WebWorldFinding(
             code=WEB_NO_TUTORIALS,
@@ -186,7 +220,7 @@ def _check_tutorials(
 
     # Anything else is only worth flagging when it is provably not a list. A call is usually a
     # factory returning one, so only a bare Tutorial(...) - the missing-brackets mistake - counts.
-    resolved = module.resolve(value)
+    resolved = package.resolve(found.module, found.value)
     if _is_lone_tutorial(resolved) or isinstance(resolved, ast.Constant):
         return WebWorldFinding(
             code=TUTORIALS_NOT_A_LIST,
@@ -208,12 +242,44 @@ def _is_lone_tutorial(node: ast.expr) -> bool:
     return callee == "Tutorial" or callee.endswith("Tutorial")
 
 
-class _ModuleIndex:
-    """Everything about a module's top level that the checks need to look up by name."""
+# --------------------------------------------------------------------------------------
+# Reading the world's modules
+# --------------------------------------------------------------------------------------
 
-    def __init__(self, tree: ast.Module) -> None:
+
+@dataclass(frozen=True)
+class _Class:
+    """A class definition, and the module it was found in."""
+
+    module: str
+    name: str
+    node: ast.ClassDef
+
+
+@dataclass(frozen=True)
+class _Attribute:
+    """A class attribute's value, and the module whose scope that value should be read in."""
+
+    module: str
+    value: ast.expr | None
+
+
+@dataclass(frozen=True)
+class _Import:
+    """A name brought into a module from elsewhere."""
+
+    module: str | None  # the module inside this world it came from, or None if from outside
+    name: str  # the original name there
+
+
+class _ModuleIndex:
+    """Everything about one module's top level that the checks need to look up by name."""
+
+    def __init__(self, path: str, tree: ast.Module, package: "_Package") -> None:
+        self.path = path
         self.classes: dict[str, ast.ClassDef] = {}
-        self.imported: set[str] = set()
+        self.imports: dict[str, _Import] = {}
+        self.star_imports: list[str | None] = []
         self.assigned: dict[str, ast.expr] = {}
         self.functions: set[str] = set()
         #: Attributes given to a class from outside its body, e.g. "MyWorld.web = MyWeb()".
@@ -225,14 +291,29 @@ class _ModuleIndex:
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.functions.add(node.name)
             elif isinstance(node, ast.Import):
-                self.imported.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+                for alias in node.names:
+                    self.imports[alias.asname or alias.name.split(".")[0]] = _Import(None, alias.name)
             elif isinstance(node, ast.ImportFrom):
-                self.imported.update(alias.asname or alias.name for alias in node.names)
+                self._record_import_from(node, package)
             elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     self._record_target(target, node.value)
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
                 self._record_target(node.target, node.value)
+
+    def _record_import_from(self, node: ast.ImportFrom, package: "_Package") -> None:
+        origin = package.resolve_module(self.path, node.level, node.module)
+        for alias in node.names:
+            if alias.name == "*":
+                self.star_imports.append(origin)
+                continue
+            local = alias.asname or alias.name
+            # "from . import web" names a submodule, not a member of the package.
+            submodule = package.join(origin, alias.name) if origin is not None else None
+            if submodule is not None and package.has(submodule):
+                self.imports[local] = _Import(submodule, "")
+            else:
+                self.imports[local] = _Import(origin, alias.name)
 
     def _record_target(self, target: ast.expr, value: ast.expr) -> None:
         if isinstance(target, ast.Name):
@@ -242,80 +323,218 @@ class _ModuleIndex:
             if owner:
                 self.patched.setdefault(owner, set()).add(target.attr)
 
-    def is_world(self, name: str) -> bool:
-        return self._descends_from(name, _WORLD_BASE)
 
-    def is_webworld(self, name: str) -> bool:
-        return self._descends_from(name, _WEBWORLD_BASE)
+class _Package:
+    """The modules of one world, parsed on demand and resolved against each other."""
 
-    def is_unknown(self, name: str) -> bool:
-        """True when a name is used but defined nowhere this module can see."""
-        return not (
-            name in self.classes or name in self.imported or name in self.assigned or name in self.functions
-        )
+    def __init__(self, sources: Mapping[str, str]) -> None:
+        self.sources = sources
+        self.errors: dict[str, SyntaxError] = {}
+        self._indexes: dict[str, _ModuleIndex | None] = {}
 
-    def patches_attribute(self, class_name: str, attribute: str) -> bool:
-        return attribute in self.patched.get(class_name, ())
+    # -- module plumbing ---------------------------------------------------------------
 
-    def resolve(self, value: ast.expr) -> ast.expr:
+    def has(self, path: str) -> bool:
+        return path in self.sources
+
+    def index(self, path: str) -> _ModuleIndex | None:
+        """Parse a module, caching both successes and failures. None means it did not parse."""
+        if path in self._indexes:
+            return self._indexes[path]
+        self._indexes[path] = None
+        source = self.sources.get(path)
+        if source is None:
+            return None
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as error:
+            self.errors[path] = error
+            return None
+        index = _ModuleIndex(path, tree, self)
+        self._indexes[path] = index
+        return index
+
+    @staticmethod
+    def join(package: str, name: str) -> str:
+        return f"{package}.{name}" if package else name
+
+    def resolve_module(self, current: str, level: int, module: str | None) -> str | None:
+        """Where an import in ``current`` points, as a module path inside this world.
+
+        None means outside the world, which is as far as the analysis can see.
+        """
+        if level == 0:
+            # Absolute: only "worlds.<name>.x" reaches back into a world, and the world's own name
+            # is not known here, so treat every absolute import as external.
+            return None
+        parts = current.split(".") if current else []
+        if self.is_package(current):
+            container = parts
+        else:
+            container = parts[:-1]
+        climb = level - 1
+        if climb > len(container):
+            return None
+        base = container[: len(container) - climb] if climb else container
+        target = list(base) + (module.split(".") if module else [])
+        return ".".join(target)
+
+    def is_package(self, path: str) -> bool:
+        """A module is a package when the archive holds it as ``<path>/__init__.py``."""
+        return path == ROOT or any(other.startswith(f"{path}.") for other in self.sources)
+
+    def reachable(self) -> list[str]:
+        """Module paths reachable from ``__init__`` by following this world's own imports.
+
+        A module the world never imports cannot register a class, so anything found there would be
+        dead code rather than a problem worth reporting.
+        """
+        seen = [ROOT]
+        queue = [ROOT]
+        while queue:
+            current = queue.pop(0)
+            index = self.index(current)
+            if index is None:
+                continue
+            targets = list(self.star_targets(index))
+            targets.extend(entry.module for entry in index.imports.values() if entry.module is not None)
+            for target in targets:
+                if self.has(target) and target not in seen:
+                    seen.append(target)
+                    queue.append(target)
+        return seen
+
+    @staticmethod
+    def star_targets(index: _ModuleIndex) -> Iterator[str]:
+        for origin in index.star_imports:
+            if origin is not None:
+                yield origin
+
+    def world_classes(self) -> Iterator[tuple[str, str, ast.ClassDef]]:
+        """Every ``World`` subclass in the modules this world reaches."""
+        for path in self.reachable():
+            index = self.index(path)
+            if index is None:
+                continue
+            for name, node in index.classes.items():
+                if self.descends_from(path, node, _WORLD_BASE):
+                    yield path, name, node
+
+    # -- name resolution ---------------------------------------------------------------
+
+    def class_def(self, module: str, name: str, depth: int = 0) -> _Class | None:
+        """The class ``name`` refers to in ``module``, following imports within this world."""
+        if not name or depth > _MAX_DEPTH:
+            return None
+        index = self.index(module)
+        if index is None:
+            return None
+        node = index.classes.get(name)
+        if node is not None:
+            return _Class(module, name, node)
+
+        entry = index.imports.get(name)
+        if entry is not None and entry.module is not None and entry.name:
+            return self.class_def(entry.module, entry.name, depth + 1)
+
+        for origin in self.star_targets(index):
+            found = self.class_def(origin, name, depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    def instances(self, module: str) -> set[str]:
+        """Module-level names bound to a call, which are instances rather than classes."""
+        index = self.index(module)
+        if index is None:
+            return set()
+        return {name for name, value in index.assigned.items() if isinstance(value, ast.Call)}
+
+    def is_unknown(self, module: str, name: str) -> bool:
+        """True when a name is used but defined nowhere the analysis can see."""
+        index = self.index(module)
+        if index is None:
+            return False
+        if name in index.classes or name in index.imports or name in index.assigned or name in index.functions:
+            return False
+        for origin in index.star_imports:
+            # A star import could be supplying the name. Only a source this analysis can read, and
+            # which turns out not to define it, leaves the name genuinely unaccounted for.
+            if origin is None or not self.is_unknown(origin, name):
+                return False
+        return True
+
+    def patches_attribute(self, module: str, class_name: str, attribute: str) -> bool:
+        """Whether any reachable module assigns ``<class>.<attribute>`` from outside the class body."""
+        for path in {module, *self.reachable()}:
+            index = self.index(path)
+            if index is not None and attribute in index.patched.get(class_name, ()):
+                return True
+        return False
+
+    def resolve(self, module: str, value: ast.expr) -> ast.expr:
         """Follow a bare name back to what it was assigned at module level, if anything."""
-        if isinstance(value, ast.Name) and value.id in self.assigned:
-            return self.assigned[value.id]
+        if isinstance(value, ast.Name):
+            index = self.index(module)
+            if index is not None and value.id in index.assigned:
+                return index.assigned[value.id]
         return value
 
-    def inherits_from_outside(self, name: str, depth: int = 0) -> bool:
-        """True when any base class is not defined in this file, so it could supply the attribute."""
-        node = self.classes.get(name)
-        if node is None or depth > _MAX_BASE_DEPTH:
-            return True
+    # -- class structure ---------------------------------------------------------------
+
+    def bases(self, module: str, node: ast.ClassDef) -> Iterator[tuple[str | None, _Class | None]]:
+        """Each base class as ``(name, resolved)``; resolved is None when it is not visible here."""
         for base in node.bases:
-            base_name = _name_of(base)
-            if base_name is None:
-                return True  # something dynamic; assume it might provide the attribute
-            if base_name in (_WORLD_BASE, _WEBWORLD_BASE):
-                continue  # core's bases, which define neither web nor tutorials usefully
-            if base_name not in self.classes:
+            name = _name_of(base)
+            yield name, (self.class_def(module, name) if name else None)
+
+    def descends_from(self, module: str, node: ast.ClassDef, ancestor: str, depth: int = 0) -> bool:
+        if depth > _MAX_DEPTH:
+            return False
+        for name, resolved in self.bases(module, node):
+            if name == ancestor:
                 return True
-            if self.inherits_from_outside(base_name, depth + 1):
+            if resolved is not None and self.descends_from(resolved.module, resolved.node, ancestor, depth + 1):
+                return True
+        return False
+
+    def inherits_from_outside(self, module: str, node: ast.ClassDef, depth: int = 0) -> bool:
+        """True when a base class is not visible here, so it could be supplying the attribute."""
+        if depth > _MAX_DEPTH:
+            return True
+        for name, resolved in self.bases(module, node):
+            if name is None:
+                return True  # something dynamic; assume it might provide the attribute
+            if name in (_WORLD_BASE, _WEBWORLD_BASE):
+                continue  # core's bases, which define neither web nor tutorials usefully
+            if resolved is None:
+                return True
+            if self.inherits_from_outside(resolved.module, resolved.node, depth + 1):
                 return True
         return False
 
     def find_attribute(
-        self, name: str, node: ast.ClassDef, attribute: str, depth: int = 0
-    ) -> tuple[bool, ast.expr | None]:
-        """Look for a class attribute here, then in the base classes defined in this file."""
+        self, module: str, node: ast.ClassDef, attribute: str, depth: int = 0
+    ) -> _Attribute | None:
+        """Look for a class attribute here, then in the base classes this world defines."""
         for statement in node.body:
             if isinstance(statement, ast.Assign):
                 for target in statement.targets:
                     if isinstance(target, ast.Name) and target.id == attribute:
-                        return True, statement.value
+                        return _Attribute(module, statement.value)
             elif isinstance(statement, ast.AnnAssign):
                 if isinstance(statement.target, ast.Name) and statement.target.id == attribute:
                     # A bare "tutorials: List[Tutorial]" annotation declares nothing at runtime,
                     # which is exactly why the base WebWorld fails the WebHost's hasattr check.
-                    return statement.value is not None, statement.value
+                    return _Attribute(module, statement.value) if statement.value is not None else None
 
-        if depth <= _MAX_BASE_DEPTH:
-            for base in node.bases:
-                base_name = _name_of(base)
-                base_node = self.classes.get(base_name) if base_name else None
-                if base_node is not None:
-                    found, value = self.find_attribute(base_name or "", base_node, attribute, depth + 1)
-                    if found:
-                        return found, value
-        return False, None
-
-    def _descends_from(self, name: str, ancestor: str, depth: int = 0) -> bool:
-        node = self.classes.get(name)
-        if node is None or depth > _MAX_BASE_DEPTH:
-            return False
-        for base in node.bases:
-            base_name = _name_of(base)
-            if base_name == ancestor:
-                return True
-            if base_name and base_name in self.classes and self._descends_from(base_name, ancestor, depth + 1):
-                return True
-        return False
+        if depth <= _MAX_DEPTH:
+            for _name, resolved in self.bases(module, node):
+                if resolved is not None:
+                    found = self.find_attribute(resolved.module, resolved.node, attribute, depth + 1)
+                    if found is not None:
+                        return found
+        return None
 
 
 def _name_of(node: ast.expr) -> str | None:
