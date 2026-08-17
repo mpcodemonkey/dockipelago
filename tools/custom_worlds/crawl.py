@@ -76,7 +76,7 @@ _FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED, OUTCOME_KNOWN_BA
 #: Bumped whenever the checks change their mind about what is acceptable. Lockfile entries written
 #: by an older version are re-verified rather than trusted, so a new check reaches worlds that were
 #: installed before it existed.
-CHECKS_VERSION = 2
+CHECKS_VERSION = 3
 
 
 @dataclass
@@ -135,6 +135,7 @@ class CrawlOptions:
     install_mode: str = INSTALL_EXTRACT
     ignore_game_mismatch: bool = False
     validate: bool = False
+    validate_python: str = sys.executable
     webhost_check: str = WEBHOST_ERROR
     max_asset_bytes: int = DEFAULT_MAX_ASSET_BYTES
 
@@ -189,7 +190,7 @@ class Crawler:
                 # is there because --all-assets asked for everything in the release.
                 result = self._fetch(asset, asset_record, staging, resolution, confirm_game=position == 0)
                 if result is not None:
-                    verified[result.path] = (asset_record, result)
+                    self._claim(verified, result, asset_record)
 
         self._apply_conflicts(verified)
         if not self.options.dry_run:
@@ -432,7 +433,7 @@ class Crawler:
         template renderer chokes on. This is the backstop: whatever Archipelago itself refuses is
         removed and recorded, so it is not downloaded again either.
         """
-        report = validate_installed_worlds(self.options.root)
+        report = validate_installed_worlds(self.options.root, python=self.options.validate_python)
         if not report.ok:
             return False, report.error
 
@@ -536,6 +537,51 @@ class Crawler:
             installed.unlink()
         record.removed = str(previous["file"])
         logger.warning("  removed %s, which is no longer acceptable", record.removed)
+
+    def _claim(
+        self,
+        verified: dict[Path, tuple[GameRecord, VerificationResult]],
+        result: VerificationResult,
+        record: GameRecord,
+    ) -> None:
+        """Record an asset against the page that resolved it, settling ties between pages.
+
+        Two pages can land on the same file. It happens when a repository ships one world and two
+        wiki pages point at it - a rename the wiki still lists under both names, or a page whose own
+        release simply is not there, so the name match settles for the only asset published. Either
+        way there is one world, installed once, under one module name.
+
+        Keyed only by path, the second page used to overwrite the first in this dict and the loser
+        was never installed - but it kept the provisional path from download time and was written to
+        the lockfile as an installed world, pointing at something that does not exist. So the tie is
+        settled openly instead: the page whose game the manifest actually names keeps the world, and
+        the other is skipped with the reason spelled out.
+        """
+        holder = verified.get(result.path)
+        if holder is None:
+            verified[result.path] = (record, result)
+            return
+
+        incumbent = holder[0]
+        expected = record.expected_game or record.title
+        claimed = result.game or ""
+        # Only a manifest that names the challenger's game, and not the incumbent's, changes hands.
+        takes_over = bool(
+            claimed
+            and matches(expected, claimed)
+            and not matches(incumbent.expected_game or incumbent.title, claimed)
+        )
+        loser, winner = (incumbent, record) if takes_over else (record, incumbent)
+        if takes_over:
+            verified[result.path] = (record, result)
+
+        loser.outcome = OUTCOME_SKIPPED
+        loser.file = ""
+        loser.reason = (
+            f"{result.path.name} is the same world '{winner.title}' resolved to; one file cannot be "
+            f"installed as two worlds, so it is recorded there"
+        )
+        logger.warning("  %s: %s", loser.title, loser.reason)
 
     def _apply_conflicts(self, verified: dict[Path, tuple[GameRecord, VerificationResult]]) -> None:
         results = [result for _record, result in verified.values()]
@@ -982,6 +1028,12 @@ def build_parser() -> argparse.ArgumentParser:
         "whatever they reject, including worlds that break the WebHost's option templates "
         "(this executes the downloaded third-party code)",
     )
+    parser.add_argument(
+        "--validate-python",
+        default=sys.executable,
+        help="interpreter to run --validate with; it needs Archipelago's own requirements "
+        "installed (default: the one running this script)",
+    )
     parser.add_argument("--report", type=Path, help="write a detailed JSON report to this path")
     parser.add_argument("--github-token", default=None, help="GitHub token (defaults to $GITHUB_TOKEN / $GH_TOKEN)")
     parser.add_argument("--timeout", type=float, default=30.0, help="per-request timeout in seconds")
@@ -1019,6 +1071,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         install_mode=args.install_mode,
         ignore_game_mismatch=args.ignore_game_mismatch,
         validate=args.validate,
+        validate_python=args.validate_python,
         webhost_check=args.webhost_check,
         max_asset_bytes=args.max_asset_bytes,
     )

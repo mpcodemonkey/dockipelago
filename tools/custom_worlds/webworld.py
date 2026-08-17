@@ -56,12 +56,15 @@ WEB_MISSING = "web-missing"
 WEB_NO_TUTORIALS = "web-no-tutorials"
 #: ``tutorials`` is set to something the WebHost cannot iterate over.
 TUTORIALS_NOT_A_LIST = "tutorials-not-a-list"
+#: ``options_presets`` maps preset names to scalars rather than to option dictionaries.
+PRESETS_NOT_NESTED = "presets-not-nested"
 
 ROOT = ""  # the world package itself, i.e. <name>/__init__.py
 
 _WORLD_BASE = "World"
 _WEBWORLD_BASE = "WebWorld"
 _TUTORIALS = "tutorials"
+_PRESETS = "options_presets"
 _WEB = "web"
 _MAX_DEPTH = 10
 
@@ -131,6 +134,21 @@ def inspect_world(modules: Mapping[str, str], *, module_name: str = "") -> list[
         ]
 
     findings: list[WebWorldFinding] = []
+    for path in package.reachable():
+        if package.index(path) is None and path in package.errors:
+            # The world imports this module, so Python will parse it too - and raise where we did.
+            error = package.errors[path]
+            findings.append(
+                WebWorldFinding(
+                    code=UNPARSEABLE,
+                    detail=(
+                        f"{label}/{path.replace('.', '/')}.py is not valid Python: "
+                        f"line {error.lineno}: {error.msg}; the world imports it, so it cannot load"
+                    ),
+                    severity=SEVERITY_LOAD,
+                )
+            )
+
     for path, name, node in package.world_classes():
         finding = _check_world(path, name, node, package)
         if finding is not None:
@@ -147,7 +165,7 @@ def _check_world(path: str, name: str, node: ast.ClassDef, package: "_Package") 
     value, owner = found.value, found.module
     if isinstance(value, ast.Call):
         root_name = _root_name_of(value.func)
-        if root_name and package.is_unknown(owner, root_name):
+        if root_name and package.is_unknown(owner, root_name) and package.class_from(owner, value.func) is None:
             callee = _name_of(value.func) or root_name
             return WebWorldFinding(
                 code=WEB_UNDEFINED,
@@ -156,9 +174,9 @@ def _check_world(path: str, name: str, node: ast.ClassDef, package: "_Package") 
                 world_class=name,
             )
         callee = _name_of(value.func) or ""
-        webworld = package.class_def(owner, callee)
+        webworld = package.class_from(owner, value.func)
         if webworld is not None:
-            return _check_tutorials(name, webworld, package)
+            return _check_tutorials(name, webworld, package) or _check_presets(name, webworld, package)
         if callee == _WEBWORLD_BASE:
             # web = WebWorld() instantiates core's base directly, and that is the very class whose
             # bare "tutorials" annotation the WebHost's hasattr check exists to reject.
@@ -174,21 +192,29 @@ def _check_world(path: str, name: str, node: ast.ClassDef, package: "_Package") 
             )
         return None
 
-    if isinstance(value, ast.Name):
-        if package.class_def(owner, value.id) is not None and value.id not in package.instances(owner):
+    if isinstance(value, (ast.Name, ast.Attribute)):
+        # web = MyGameWeb and web = web_world.MyGameWeb are the same mistake, so both are resolved
+        # the same way; only where to look for a same-named instance differs.
+        written = ast.unparse(value)
+        home = owner if isinstance(value, ast.Name) else package.module_of(owner, value.value)
+        attribute = value.id if isinstance(value, ast.Name) else value.attr
+        if package.class_from(owner, value) is not None and (
+            home is None or attribute not in package.instances(home)
+        ):
             return WebWorldFinding(
                 code=WEB_NOT_INSTANTIATED,
                 detail=(
-                    f"{name} sets web = {value.id} instead of web = {value.id}(); core asserts "
+                    f"{name} sets web = {written} instead of web = {written}(); core asserts "
                     "'WebWorld has to be instantiated.' and the world will not load"
                 ),
                 severity=SEVERITY_LOAD,
                 world_class=name,
             )
-        if package.is_unknown(owner, value.id):
+        root_name = _root_name_of(value)
+        if root_name and package.is_unknown(owner, root_name) and package.class_from(owner, value) is None:
             return WebWorldFinding(
                 code=WEB_UNDEFINED,
-                detail=f"{name} sets web = {value.id}, but {value.id} is never defined or imported",
+                detail=f"{name} sets web = {written}, but {root_name} is never defined or imported",
                 severity=SEVERITY_LOAD,
                 world_class=name,
             )
@@ -252,6 +278,42 @@ def _check_tutorials(world_name: str, webworld: "_Class", package: "_Package") -
     return None
 
 
+def _check_presets(world_name: str, webworld: "_Class", package: "_Package") -> WebWorldFinding | None:
+    """``options_presets`` maps a preset *name* to a dict of option values, not to a value.
+
+    Getting this wrong is worse than it sounds. The WebHost renders one template per preset and does
+    ``option_key in preset``; against a scalar that raises TypeError, ``create_options_files()``
+    propagates it, and the server never finishes starting - so this takes the whole site down rather
+    than dropping one game.
+    """
+    found = package.find_attribute(webworld.module, webworld.node, _PRESETS)
+    if found is None or found.value is None:
+        return None
+
+    where = package.value_of(found.module, found.value)
+    presets = where.value
+    if not isinstance(presets, ast.Dict):
+        return None
+
+    for key, value in zip(presets.keys, presets.values, strict=False):
+        if not package.is_definitely_scalar(where.module, value):
+            continue
+        preset = key.value if isinstance(key, ast.Constant) else "?"
+        return WebWorldFinding(
+            code=PRESETS_NOT_NESTED,
+            detail=(
+                f"{webworld.name} sets 'options_presets' to a flat mapping - preset {preset!r} is a "
+                "single value, not a dictionary of option settings. The WebHost renders a template "
+                "per preset and this raises, so create_options_files() fails and the server does "
+                "not start at all. It should read like "
+                "{'Preset Name': {'option_name': value, ...}}"
+            ),
+            severity=SEVERITY_WEBHOST,
+            world_class=world_name,
+        )
+    return None
+
+
 def _is_lone_tutorial(node: ast.expr) -> bool:
     """``tutorials = Tutorial(...)`` - the same thing as the list form, minus the brackets."""
     if not isinstance(node, ast.Call):
@@ -276,7 +338,7 @@ class _Class:
 
 @dataclass(frozen=True)
 class _Attribute:
-    """A class attribute's value, and the module whose scope that value should be read in."""
+    """An expression, and the module whose scope it should be read in."""
 
     module: str
     value: ast.expr | None
@@ -364,7 +426,9 @@ class _Package:
         if source is None:
             return None
         try:
-            tree = ast.parse(source)
+            # Python strips a UTF-8 BOM when it imports a file; ast.parse does not, and would
+            # otherwise reject a perfectly importable module for its first character.
+            tree = ast.parse(source.lstrip("\ufeff"))
         except SyntaxError as error:
             self.errors[path] = error
             return None
@@ -439,6 +503,40 @@ class _Package:
                     yield path, name, node
 
     # -- name resolution ---------------------------------------------------------------
+
+    def class_from(self, module: str, expression: ast.expr, depth: int = 0) -> _Class | None:
+        """The class an expression names, following module aliases as well as plain names.
+
+        ``web = MyGameWeb()`` and ``web = web_world.MyGameWeb()`` are equally common, and the second
+        needs the alias resolving to a module before the class can be looked up inside it.
+        """
+        if isinstance(expression, ast.Name):
+            return self.class_def(module, expression.id, depth)
+        if isinstance(expression, ast.Attribute):
+            container = self.module_of(module, expression.value)
+            if container is not None:
+                return self.class_def(container, expression.attr, depth)
+        return None
+
+    def module_of(self, module: str, expression: ast.expr, depth: int = 0) -> str | None:
+        """The module inside this world that an expression refers to, if any."""
+        if depth > _MAX_DEPTH:
+            return None
+        index = self.index(module)
+        if index is None:
+            return None
+        if isinstance(expression, ast.Name):
+            entry = index.imports.get(expression.id)
+            # A module alias is recorded with an empty original name.
+            if entry is not None and entry.module is not None and not entry.name:
+                return entry.module
+            return None
+        if isinstance(expression, ast.Attribute):
+            parent = self.module_of(module, expression.value, depth + 1)
+            if parent is not None:
+                candidate = self.join(parent, expression.attr)
+                return candidate if self.has(candidate) else None
+        return None
 
     def class_def(self, module: str, name: str, depth: int = 0) -> _Class | None:
         """The class ``name`` refers to in ``module``, following imports within this world."""
@@ -520,6 +618,49 @@ class _Package:
             index = self.index(path)
             if index is not None and attribute in index.patched.get(class_name, ()):
                 return True
+        return False
+
+    def value_of(self, module: str, expression: ast.expr, depth: int = 0) -> _Attribute:
+        """Follow a name to what it was assigned, across modules where the import is visible.
+
+        The module comes back with the value, because whatever the value refers to has to be looked
+        up where it was written - a dict in ``Options.py`` names classes from ``Options.py``, not
+        from the module that imported it.
+        """
+        if depth > _MAX_DEPTH or not isinstance(expression, ast.Name):
+            return _Attribute(module, expression)
+        index = self.index(module)
+        if index is None:
+            return _Attribute(module, expression)
+        if expression.id in index.assigned:
+            return self.value_of(module, index.assigned[expression.id], depth + 1)
+        entry = index.imports.get(expression.id)
+        if entry is not None and entry.module is not None and entry.name:
+            origin = self.index(entry.module)
+            if origin is not None and entry.name in origin.assigned:
+                return self.value_of(entry.module, origin.assigned[entry.name], depth + 1)
+        return _Attribute(module, expression)
+
+    def is_definitely_scalar(self, module: str, expression: ast.expr, depth: int = 0) -> bool:
+        """Whether an expression provably evaluates to a single value rather than a mapping.
+
+        Only provable cases count: a literal, a name bound to one, or a class attribute like
+        ``DragunGoal.default`` whose definition is visible. Anything else is left alone.
+        """
+        if depth > _MAX_DEPTH:
+            return False
+        where = self.value_of(module, expression)
+        resolved = where.value
+        if isinstance(resolved, ast.Constant):
+            return resolved.value is not None
+        if isinstance(resolved, (ast.List, ast.Tuple, ast.Set)):
+            return True
+        if isinstance(resolved, ast.Attribute):
+            owner = self.class_from(where.module, resolved.value)
+            if owner is not None:
+                found = self.find_attribute(owner.module, owner.node, resolved.attr)
+                if found is not None and found.value is not None:
+                    return self.is_definitely_scalar(found.module, found.value, depth + 1)
         return False
 
     def resolve(self, module: str, value: ast.expr) -> ast.expr:

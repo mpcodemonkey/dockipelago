@@ -168,7 +168,11 @@ parsed, never imported — and fall into two groups.
 | --- | --- |
 | `web = MyGameWeb` — the class, not an instance | `AutoWorldRegister` asserts `isinstance(dct["web"], WebWorld)`, so importing raises `AssertionError: WebWorld has to be instantiated.` |
 | `web = MyGameWeb()` where `MyGameWeb` does not exist | `NameError` at import |
-| the file is not valid Python | `SyntaxError`, which aborts `import worlds` entirely rather than being caught per-world |
+| any module the world imports is not valid Python | `SyntaxError`, which aborts `import worlds` entirely rather than being caught per-world |
+
+The first two are recognised in their module-qualified form as well — `web = web_world.MyGameWeb`
+and `web = web_world.MyGameWeb()` are exactly as common as the bare-name form, and the alias is
+resolved to the module inside the apworld before the class is looked up there.
 
 **The world loads, but the WebHost drops it.** `WebHost.py` filters its world list with
 `hasattr(world.web, "tutorials")`, logs
@@ -205,6 +209,20 @@ from one that was never written — which is the right answer, since that is exa
 too. `tutorials = []` is accepted, because core accepts it. `tutorials = Tutorial(...)` without the
 brackets is rejected, since the WebHost iterates the attribute.
 
+**The world loads, but the WebHost never finishes starting.** One shape is worse than being dropped:
+
+```python
+options_presets = {"Dragun": 3}          # rejected
+options_presets = {"Dragun": {"goal": 3}}  # correct
+```
+
+`options_presets` maps a preset *name* to a dictionary of option settings. The WebHost renders one
+template per preset and asks `option_key in preset`; against a scalar that raises `TypeError`,
+`create_options_files()` propagates it, and the site does not come up at all — see
+[`--validate`](#--validate-asking-archipelago-instead-of-guessing) below for the same failure caught
+from the other direction. Only a literal scalar is reported; a preset built by a call, or holding a
+name that cannot be resolved to a value, stays quiet.
+
 These are refused by default: a world the WebHost will not serve is dead weight in an image built to
 serve exactly that. `--webhost-check warn` installs them anyway and lists them at the end of the run,
 and `--webhost-check off` skips the question entirely. Neither setting can rescue a world from the
@@ -225,6 +243,12 @@ carries its entire package, so relative imports are followed inside it:
   lives, including through base classes in yet another module;
 - subpackages are followed too, so `from .sub.web import MyGameWeb` works.
 
+A module that fails to parse is treated by what the world does with it. If `__init__` reaches it, the
+world cannot load and it is rejected; if nothing imports it, it is dead code and stays quiet. A
+leading UTF-8 byte-order mark is stripped before parsing, since several published worlds carry one
+and it would otherwise make every module look unreadable — and an unreadable package has nothing to
+complain about, which is the quietest way for a broken world to pass.
+
 **Only provable problems are reported.** Names imported from outside the world, base classes in
 another package, `tutorials` built by a function call, an instance built at module level, and
 `MyGameWorld.web` patched on after the class body all stay quiet, because a false positive costs a
@@ -240,6 +264,12 @@ they fire:
 
 - a world whose module name would shadow one that already ships with Archipelago;
 - two worlds claiming the same module name or the same `game`, where core silently loads only one.
+
+Two *pages* can also land on the same file — a rename the wiki still lists under both names, or a
+page whose own release is not in the repository, so the name match settles for the only asset there.
+There is one world, and it is installed once: the page whose game the manifest actually names keeps
+it, and the other is skipped with the reason recorded. (Both pages are still reported, so the one
+without a world of its own is visible rather than silently equated with the other.)
 
 ### `--validate`: asking Archipelago instead of guessing
 
@@ -272,8 +302,20 @@ every culprit is named in one pass along with the underlying error rather than t
 **Worlds that fail are removed and recorded** in the lockfile's `rejected` list, so they are not
 downloaded again. Only worlds this run installed are removed; a verdict against something else —
 a world that ships with Archipelago, or one placed by hand — is reported and left alone. If
-validation cannot run at all (Archipelago's own dependencies missing, say), nothing is removed and
-the run exits non-zero.
+validation cannot run at all, nothing is removed and the run exits non-zero.
+
+Because it runs the real Archipelago, it needs the environment the WebHost runs in. Missing
+dependencies are the usual reason it will not start:
+
+```
+validation could not run: Archipelago's own dependency 'pathspec' is not installed for
+/usr/bin/python3, so its worlds cannot be imported.
+```
+
+Either install them (`python ModuleUpdate.py --yes`, or `pip install -r requirements.txt`), or point
+at an interpreter that already has them with `--validate-python /path/to/python`. Only `--validate`
+uses that interpreter; the crawl itself runs wherever it was started and needs nothing but the
+standard library.
 
 This **runs the downloaded worlds' module-level code**, which is third-party Python. It is the same
 code the Docker image executes when serving them, so it is not a new exposure; it is worth being
@@ -325,7 +367,7 @@ exactly once:
   "removed": "worlds/some_game",
   "first_rejected": "2026-08-16T23:10:33Z",
   "checked": {
-    "checks_version": 2,
+    "checks_version": 3,
     "archipelago_version": "0.6.8",
     "container_version": 7,
     "webhost_check": "error"
@@ -371,6 +413,7 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 | `--ignore-game-mismatch` | install even when the manifest names a different game than the page |
 | `--webhost-check {error,warn,off}` | what to do about worlds the WebHost would drop (default `error`) |
 | `--validate` | after installing, run Archipelago's start-up checks and remove what they reject |
+| `--validate-python PATH` | interpreter to run `--validate` with, when this one lacks Archipelago's requirements |
 | `--recursive` | descend into subcategories |
 | `--strict` | exit non-zero if any game failed |
 | `--keep-staging DIR` | keep the downloaded files for inspection |

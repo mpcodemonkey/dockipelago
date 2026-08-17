@@ -83,6 +83,9 @@ def emit(payload):
 try:
     import worlds
     from worlds import AutoWorldRegister
+except ModuleNotFoundError as missing:
+    emit({"missing_dependency": missing.name or "", "error": traceback.format_exc()[-2000:]})
+    raise SystemExit(0)
 except Exception:
     emit({"error": "importing worlds failed:\\n" + traceback.format_exc()[-4000:]})
     raise SystemExit(0)
@@ -169,6 +172,17 @@ def validate_installed_worlds(
     if payload is None:
         detail = (process.stderr or process.stdout).strip()[-4000:]
         return ValidationReport(error=detail or f"validation exited with status {process.returncode}")
+    missing = str(payload.get("missing_dependency") or "")
+    if missing:
+        return ValidationReport(
+            error=(
+                f"Archipelago's own dependency '{missing}' is not installed for {python}, so its "
+                "worlds cannot be imported. Validation runs the real Archipelago, so it needs the "
+                "same environment the WebHost runs in. Either install them "
+                "(python ModuleUpdate.py --yes, or pip install -r requirements.txt), or point at "
+                "the interpreter that already has them with --validate-python."
+            )
+        )
     if payload.get("error"):
         return ValidationReport(error=str(payload["error"]))
 

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from tools.custom_worlds.webworld import (
+    PRESETS_NOT_NESTED,
     ROOT,
     SEVERITY_LOAD,
     SEVERITY_WEBHOST,
@@ -394,13 +395,108 @@ class TestAcrossModules(unittest.TestCase):
     def test_a_world_with_no_init_module_is_ignored(self) -> None:
         self.assertEqual([], self.codes({"web": self.NO_TUTORIALS}))
 
-    def test_a_broken_sibling_module_does_not_derail_the_check(self) -> None:
+    def test_a_broken_module_the_world_imports_is_reported(self) -> None:
+        # Python will parse it too, and raise where we did, so the world cannot load at all.
         modules = {
             ROOT: 'from worlds.AutoWorld import World\nfrom .web import GameWeb\n'
                   'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
             "web": "class GameWeb(WebWorld)\n    broken\n",
         }
+        findings = inspect_world(modules, module_name="mygame")
+        self.assertEqual([UNPARSEABLE], [f.code for f in findings])
+        self.assertEqual(SEVERITY_LOAD, findings[0].severity)
+        self.assertIn("mygame/web.py", findings[0].detail)
+
+    def test_a_broken_module_the_world_never_imports_is_ignored(self) -> None:
+        modules = {
+            ROOT: "from worlds.AutoWorld import World, WebWorld\nfrom BaseClasses import Tutorial\n"
+                  'class GameWeb(WebWorld):\n    tutorials = [Tutorial("S", "d", "en", "s.md", "s/en", ["m"])]\n'
+                  'class GameWorld(World):\n    game = "G"\n    web = GameWeb()\n',
+            "scratch": "this is not python at all !!!\n",
+        }
         self.assertEqual([], self.codes(modules))
+
+
+class TestByteOrderMark(WebWorldTestCase):
+    """A leading BOM used to make ast.parse raise, which silently skipped the whole module.
+
+    Both sulfur and gta_sa reached a real Archipelago install this way: the checks saw an empty
+    package, found nothing to complain about, and the world was installed anyway.
+    """
+
+    def test_a_bom_does_not_hide_a_broken_world(self) -> None:
+        finding = self.only("﻿" + world("web = MyGameWeb"))
+        self.assertEqual(WEB_NOT_INSTANTIATED, finding.code)  # type: ignore[attr-defined]
+
+    def test_a_bom_on_a_healthy_world_is_still_clean(self) -> None:
+        self.assertEqual([], self.codes("﻿" + world("web = MyGameWeb()")))
+
+
+class TestModuleQualifiedReferences(WebWorldTestCase):
+    """``web = web_world.MyGameWeb()`` is as common as the bare-name form, and used to be missed."""
+
+    def codes(self, modules: dict[str, str]) -> list[str]:  # type: ignore[override]
+        return [finding.code for finding in inspect_world(modules, module_name="mygame")]
+
+    WEB_MODULE = (
+        "from worlds.AutoWorld import WebWorld\nfrom BaseClasses import Tutorial\n"
+        'class MyGameWeb(WebWorld):\n    tutorials = [Tutorial("S", "d", "en", "s.md", "s/en", ["m"])]\n'
+    )
+
+    def test_a_qualified_instance_is_accepted(self) -> None:
+        modules = {
+            ROOT: "from worlds.AutoWorld import World\nfrom . import web_world\n"
+                  'class MyGameWorld(World):\n    game = "G"\n    web = web_world.MyGameWeb()\n',
+            "web_world": self.WEB_MODULE,
+        }
+        self.assertEqual([], self.codes(modules))
+
+    def test_a_qualified_class_is_still_not_instantiated(self) -> None:
+        modules = {
+            ROOT: "from worlds.AutoWorld import World\nfrom . import web_world\n"
+                  'class MyGameWorld(World):\n    game = "G"\n    web = web_world.MyGameWeb\n',
+            "web_world": self.WEB_MODULE,
+        }
+        self.assertEqual([WEB_NOT_INSTANTIATED], self.codes(modules))
+
+    def test_a_qualified_webworld_without_tutorials_is_caught(self) -> None:
+        modules = {
+            ROOT: "from worlds.AutoWorld import World\nfrom . import web_world\n"
+                  'class MyGameWorld(World):\n    game = "G"\n    web = web_world.MyGameWeb()\n',
+            "web_world": "from worlds.AutoWorld import WebWorld\n"
+                         'class MyGameWeb(WebWorld):\n    theme = "grass"\n',
+        }
+        self.assertEqual([WEB_NO_TUTORIALS], self.codes(modules))
+
+
+class TestOptionsPresets(WebWorldTestCase):
+    """A flat ``options_presets`` stops the WebHost booting, so it is worth catching statically."""
+
+    def preset(self, body: str) -> list[str]:
+        source = (
+            "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
+            f"class MyGameWeb(WebWorld):\n{TUTORIALS}{body}"
+            '\n\nclass MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+        return self.codes(source)
+
+    def test_a_preset_mapped_to_a_scalar_is_reported(self) -> None:
+        codes = self.preset('    options_presets = {"Dragun": 3}\n')
+        self.assertEqual([PRESETS_NOT_NESTED], codes)
+
+    def test_a_preset_mapped_to_a_dict_is_accepted(self) -> None:
+        codes = self.preset('    options_presets = {"Dragun": {"goal": 3}}\n')
+        self.assertEqual([], codes)
+
+    def test_a_preset_built_elsewhere_is_left_alone(self) -> None:
+        codes = self.preset("    options_presets = build_presets()\n")
+        self.assertEqual([], codes)
+
+    def test_a_preset_holding_an_option_object_is_left_alone(self) -> None:
+        # Enter The Gungeon's real mistake looked like this, but a name we cannot resolve to a
+        # scalar is not evidence of one - only a literal is.
+        codes = self.preset('    options_presets = {"Dragun": DragunGoal.default}\n')
+        self.assertEqual([], codes)
 
 
 class TestAgainstTheBundledWorlds(unittest.TestCase):

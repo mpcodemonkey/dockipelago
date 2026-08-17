@@ -92,6 +92,16 @@ class CrawlTestCase(unittest.TestCase):
             init_source=init_source,
         )
 
+    def add_page(self, title: str, *, repo: str) -> None:
+        """A second wiki page pointing at a repository that already has its release and asset."""
+        href = f"https://github.com/{repo}"
+        self.pages[title] = {
+            "title": title,
+            "wikitext": f"{{{{Infobox game\n| title = {title}\n| download = [{href} Download]\n}}}}",
+            "text": wiki_page_html(title=title, download_href=href),
+            "externallinks": [href],
+        }
+
     def _serve_category(self, _url: str) -> dict[str, Any]:
         members = [{"ns": 0, "title": title} for title in self.pages]
         return {"query": {"categorymembers": members}}
@@ -381,6 +391,39 @@ class TestFailures(CrawlTestCase):
             self.assertEqual(OUTCOME_SKIPPED, record.outcome)
             self.assertIn("provided by more than one file", record.reason)
         self.assertEqual([], self.lock["worlds"])
+
+    def test_two_pages_resolving_to_one_file_record_it_once(self) -> None:
+        """A repo shipping one world that two pages point at, as Wargroove 2 / Votipelago did.
+
+        Both pages resolve the same asset. Only one world can be installed, and the lockfile has to
+        say so: the page that loses used to be written as installed, pointing at a path that was
+        never created.
+        """
+        self.add_game("Wargroove 2", repo="fly/ap", asset_name="wargroove2.apworld",
+                      manifest=default_manifest("Wargroove 2"))
+        self.add_page("Votipelago", repo="fly/ap")
+        records = self.crawl()
+
+        self.assert_installed("wargroove2")
+        winner = self.record_for(records, "Wargroove 2")
+        loser = self.record_for(records, "Votipelago")
+        self.assertEqual(OUTCOME_SKIPPED, loser.outcome)
+        self.assertIn("same world 'Wargroove 2'", loser.reason)
+        self.assertEqual("", loser.file)
+
+        titles = [entry["title"] for entry in self.lock["worlds"]]
+        self.assertEqual(["Wargroove 2"], titles)
+        self.assertEqual(self.relative("wargroove2"), winner.file)
+
+    def test_the_page_the_manifest_names_keeps_the_world(self) -> None:
+        # Whichever order the pages come in, the world belongs to the page its manifest agrees with.
+        self.add_game("Votipelago", repo="fly/ap", asset_name="wargroove2.apworld",
+                      manifest=default_manifest("Wargroove 2"))
+        self.add_page("Wargroove 2", repo="fly/ap")
+        records = self.crawl()
+
+        self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Votipelago").outcome)
+        self.assertEqual([entry["title"] for entry in self.lock["worlds"]], ["Wargroove 2"])
 
     def test_a_wiki_page_that_fails_to_load_is_reported(self) -> None:
         self.pages["Broken Page"] = {}
