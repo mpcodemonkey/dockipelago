@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from test.custom_worlds.helpers import FakeHttp, default_manifest, make_apworld, release, wiki_page_html
 from tools.custom_worlds.crawl import (
@@ -24,6 +25,12 @@ from tools.custom_worlds.crawl import (
     write_lockfile,
 )
 from tools.custom_worlds.releases import GitHubClient
+from tools.custom_worlds.validate import (
+    INVALID_FOR_WEBHOST,
+    TEMPLATE_FAILED,
+    ValidationReport,
+    WorldVerdict,
+)
 from tools.custom_worlds.verify import CoreVersions
 from tools.custom_worlds.wiki import WikiClient
 
@@ -1092,6 +1099,100 @@ class TestMultiModuleWorlds(CrawlTestCase):
         self.add_split_game(self.WITH_TUTORIALS)
         self.crawl()
         self.assertTrue((self.world_path("mygame") / "web.py").is_file())
+
+
+class TestValidation(CrawlTestCase):
+    """The backstop: whatever Archipelago itself rejects is removed and remembered."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_game("Good Game", repo="a/a", asset_name="good.apworld")
+        self.add_game("Bad Game", repo="b/b", asset_name="bad.apworld")
+        self.report = ValidationReport(
+            ok=True,
+            registered=2,
+            verdicts=[
+                WorldVerdict(
+                    game="Bad Game Game",
+                    module="bad",
+                    status=TEMPLATE_FAILED,
+                    reason="AttributeError: 'list' object has no attribute 'update'",
+                ),
+            ],
+        )
+
+    def crawl_with_validation(self, report: ValidationReport, **options: Any) -> list[GameRecord]:
+        settings = self.options(validate=True, **options)
+        crawler = Crawler(
+            settings,
+            WikiClient(self.http),  # type: ignore[arg-type]
+            GitHubClient(self.http, token=None),  # type: ignore[arg-type]
+            VERSIONS,
+        )
+        records = crawler.run(self.staging)
+        with mock.patch("tools.custom_worlds.crawl.validate_installed_worlds", return_value=report):
+            self.passed, self.detail = crawler.validate_and_remove()
+        write_lockfile(
+            settings.lockfile,
+            records,
+            settings,
+            VERSIONS,
+            previously_installed=crawler.previous,
+            previously_rejected=crawler.rejected,
+        )
+        return records
+
+    def test_a_world_archipelago_rejects_is_removed(self) -> None:
+        records = self.crawl_with_validation(self.report)
+        self.assertTrue(self.passed, self.detail)
+        record = self.record_for(records, "Bad Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("template-failed", record.reason)
+        self.assertEqual(self.relative("bad"), record.removed)
+        self.assert_not_installed("bad")
+
+    def test_the_rest_are_left_alone(self) -> None:
+        records = self.crawl_with_validation(self.report)
+        self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Good Game").outcome)
+        self.assert_installed("good")
+
+    def test_the_rejection_is_recorded_so_it_is_not_downloaded_again(self) -> None:
+        self.crawl_with_validation(self.report)
+        rejected = self.lock["rejected"]
+        self.assertEqual(["Bad Game"], [entry["title"] for entry in rejected])
+        self.assertIn(TEMPLATE_FAILED, rejected[0]["codes"])
+        self.assertEqual(["Good Game"], [entry["title"] for entry in self.lock["worlds"]])
+
+        self.http.requests.clear()
+        records = self.crawl()
+        self.assertEqual(OUTCOME_KNOWN_BAD, self.record_for(records, "Bad Game").outcome)
+        self.assertEqual([], [r for r in self.http.requests if "/releases/download/bad" in r])
+
+    def test_nothing_is_removed_when_validation_cannot_run(self) -> None:
+        broken = ValidationReport(ok=False, error="ModuleNotFoundError: no module named 'schema'")
+        records = self.crawl_with_validation(broken)
+        self.assertFalse(self.passed)
+        self.assertIn("schema", self.detail)
+        for title in ("Good Game", "Bad Game"):
+            self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, title).outcome)
+        self.assert_installed("good")
+        self.assert_installed("bad")
+
+    def test_a_verdict_for_a_world_this_run_did_not_install_is_only_reported(self) -> None:
+        report = ValidationReport(
+            ok=True,
+            registered=1,
+            verdicts=[WorldVerdict(game="Some Core Game", module="alttp", status=INVALID_FOR_WEBHOST)],
+        )
+        records = self.crawl_with_validation(report)
+        self.assertTrue(self.passed)
+        for title in ("Good Game", "Bad Game"):
+            self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, title).outcome)
+
+    def test_a_dry_run_removes_nothing(self) -> None:
+        # A dry run installs nothing, so there is nothing for validation to take back out either.
+        records = self.crawl(self.options(dry_run=True, validate=True))
+        self.assertEqual(OUTCOME_RESOLVED, self.record_for(records, "Bad Game").outcome)
 
 
 class TestArchiveMode(CrawlTestCase):

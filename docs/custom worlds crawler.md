@@ -23,8 +23,8 @@ python tools/crawl_custom_worlds.py --dry-run
 # Install everything it can into worlds/.
 python tools/crawl_custom_worlds.py
 
-# Install, then confirm core actually loads the result.
-python tools/crawl_custom_worlds.py --import-check
+# Install, then run Archipelago's own start-up checks and drop whatever fails them.
+python tools/crawl_custom_worlds.py --validate
 ```
 
 The script only needs the Python standard library, so it can run before Archipelago's own
@@ -241,13 +241,46 @@ they fire:
 - a world whose module name would shadow one that already ships with Archipelago;
 - two worlds claiming the same module name or the same `game`, where core silently loads only one.
 
-### The import check
+### `--validate`: asking Archipelago instead of guessing
 
-`--import-check` imports `worlds/` in a subprocess afterwards and reports anything in
-`failed_world_loads`. This is the strongest signal available — it is exactly what the web host does
-at start-up — but it **runs the downloaded worlds' module-level code**, which is third-party Python.
-That is the same code the Docker image would execute when serving these games, so it is not a new
-exposure; it is worth being deliberate about, which is why it is opt-in.
+Reading source has limits that no amount of tightening removes. A world can hand its `WebWorld` back
+from a factory function, build its `World` class with `type()`, or ship an option the WebHost's
+template renderer chokes on — none of which is decidable from the text. So `--validate` stops
+predicting and runs the same sequence `WebHost.py` runs at start-up, in a subprocess, reporting a
+verdict per game:
+
+| Verdict | What it means |
+| --- | --- |
+| `failed-to-load` | the world is in `failed_world_loads`; it never registered |
+| `invalid-for-webhost` | it fails `hasattr(world.web, "tutorials")`, so the WebHost drops it |
+| `template-failed` | `Options.generate_yaml_templates` raises on it |
+
+That last one is why this exists. The WebHost calls it through `create_options_files()` **before it
+serves anything**, and it raises on the first world it cannot render — so one bad world does not get
+dropped, it stops the server from starting:
+
+```
+File "/app/Options.py", line 1883, in generate_yaml_templates
+    raise Exception(f"Template generation failed for world {game_name}") from ex
+Exception: Template generation failed for world Enter The Gungeon
+```
+
+Archipelago names the world but aborts there, so a second offender stays hidden until the first is
+gone. `--validate` runs the step per world, with the registry narrowed to one game at a time, so
+every culprit is named in one pass along with the underlying error rather than the wrapper.
+
+**Worlds that fail are removed and recorded** in the lockfile's `rejected` list, so they are not
+downloaded again. Only worlds this run installed are removed; a verdict against something else —
+a world that ships with Archipelago, or one placed by hand — is reported and left alone. If
+validation cannot run at all (Archipelago's own dependencies missing, say), nothing is removed and
+the run exits non-zero.
+
+This **runs the downloaded worlds' module-level code**, which is third-party Python. It is the same
+code the Docker image executes when serving them, so it is not a new exposure; it is worth being
+deliberate about, which is why it is opt-in.
+
+Static checks stay worth having: they need no dependencies, execute nothing, and catch most of this
+in seconds during the crawl. `--validate` is the backstop for what they cannot see.
 
 ## Install modes
 
@@ -337,6 +370,7 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 | `--allow-prerelease` | accept pre-release GitHub releases |
 | `--ignore-game-mismatch` | install even when the manifest names a different game than the page |
 | `--webhost-check {error,warn,off}` | what to do about worlds the WebHost would drop (default `error`) |
+| `--validate` | after installing, run Archipelago's start-up checks and remove what they reject |
 | `--recursive` | descend into subcategories |
 | `--strict` | exit non-zero if any game failed |
 | `--keep-staging DIR` | keep the downloaded files for inspection |
@@ -356,9 +390,10 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 - Only one world per page is installed unless `--all-assets` is passed.
 - The crawler does not evaluate whether a world is any good, only whether core can load it. A world
   that imports cleanly can still fail during generation.
-- The WebWorld analysis follows imports inside the apworld, but stops at its edge. A world whose
-  `WebWorld` comes from another package, or is built at runtime rather than declared, is not judged
-  — use `--import-check` to catch those.
+- The static WebWorld analysis follows imports inside the apworld, but stops at its edge, and cannot
+  decide anything built at runtime — a `WebWorld` returned by a factory, or a `World` class made with
+  `type()`. `--validate` is the answer to all of those, since it asks Archipelago rather than the
+  source.
 
 ## Tests
 

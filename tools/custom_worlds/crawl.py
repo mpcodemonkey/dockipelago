@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import zipfile
@@ -29,6 +28,7 @@ from typing import Any
 from .http import HttpClient, HttpError
 from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
+from .validate import validate_installed_worlds
 from .verify import (
     STATUS_INVALID,
     STATUS_OK,
@@ -134,6 +134,7 @@ class CrawlOptions:
     prune: bool = False
     install_mode: str = INSTALL_EXTRACT
     ignore_game_mismatch: bool = False
+    validate: bool = False
     webhost_check: str = WEBHOST_ERROR
     max_asset_bytes: int = DEFAULT_MAX_ASSET_BYTES
 
@@ -423,6 +424,61 @@ class Crawler:
         record.world_version = str(previous.get("world_version") or "")
         record.verification = str(previous.get("verification") or STATUS_OK)
         return True
+
+    def validate_and_remove(self) -> tuple[bool, str]:
+        """Run Archipelago's own start-up checks and take out whatever they reject.
+
+        The static checks cannot see a WebWorld built by a factory, or an option the WebHost's
+        template renderer chokes on. This is the backstop: whatever Archipelago itself refuses is
+        removed and recorded, so it is not downloaded again either.
+        """
+        report = validate_installed_worlds(self.options.root)
+        if not report.ok:
+            return False, report.error
+
+        logger.info("Archipelago registered %d world(s)", report.registered)
+        by_module = report.by_module()
+        removed = 0
+        for record in self.records:
+            if not record.succeeded or not record.file:
+                continue
+            verdict = by_module.get(Path(record.file).stem)
+            if verdict is None:
+                continue
+            record.outcome = OUTCOME_SKIPPED
+            record.reason = f"{verdict.status}: {verdict.reason}"
+            record.codes.append(verdict.status)
+            record.verification = STATUS_INVALID
+            logger.warning("  %s: %s", record.title, record.reason)
+            self._remove_path(record)
+            removed += 1
+
+        unclaimed = [
+            verdict
+            for module, verdict in by_module.items()
+            if module not in {Path(record.file).stem for record in self.records if record.file}
+        ]
+        for verdict in unclaimed:
+            # A world this run did not install - already present, or shipped with Archipelago.
+            logger.warning("  %s (%s) is rejected by Archipelago but was not installed by this run",
+                           verdict.game or verdict.module, verdict.status)
+
+        return True, f"removed {removed} world(s) Archipelago rejected" if removed else ""
+
+    def _remove_path(self, record: GameRecord) -> None:
+        """Delete what this run installed for a record, once it turns out to be unusable."""
+        installed = self.options.root / record.file
+        if installed.parent != self.options.output_dir or not installed.exists():
+            return
+        if self.options.dry_run:
+            logger.warning("  would remove %s", record.file)
+            return
+        if installed.is_dir():
+            shutil.rmtree(installed)
+        else:
+            installed.unlink()
+        record.removed = record.file
+        record.file = ""
 
     def _checked_the_same_way(self, entry: dict[str, Any]) -> bool:
         """Whether a lockfile entry was produced by the same checks this run is applying.
@@ -751,46 +807,6 @@ def log_summary(records: Sequence[GameRecord]) -> None:
             )
 
 
-def run_import_check(root: Path, python: str = sys.executable) -> tuple[bool, str]:
-    """Import ``worlds`` in a subprocess and report which worlds core refused to load.
-
-    This runs the downloaded worlds' module-level code, which is third-party Python. Only use it on
-    apworlds you are willing to execute - the same code runs when the Docker image serves them.
-    """
-    script = (
-        "import json, sys\n"
-        "import worlds\n"
-        "json.dump({\n"
-        "    'games': sorted(worlds.AutoWorldRegister.world_types),\n"
-        "    'failed': {name: reason.splitlines()[-1] for name, reason in worlds.failed_world_loads.items()},\n"
-        "}, sys.stdout)\n"
-    )
-    logger.info("Running the import check (this executes the downloaded worlds)")
-    process = subprocess.run(
-        [python, "-c", script],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "PYTHONPATH": str(root)},
-        check=False,
-    )
-    if process.returncode != 0:
-        return False, (process.stderr or process.stdout).strip()[-4000:]
-
-    try:
-        payload = json.loads(process.stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
-        return False, f"could not parse the import check output: {process.stdout[-2000:]}"
-
-    failed: dict[str, str] = payload.get("failed", {})
-    logger.info("Import check: %d world(s) registered", len(payload.get("games", [])))
-    if failed:
-        for name, reason in sorted(failed.items()):
-            logger.warning("  %s failed to load: %s", name, reason)
-        return False, f"{len(failed)} world(s) failed to load"
-    return True, ""
-
-
 def extract_world(archive: Path, destination: Path) -> None:
     """Unpack the ``<stem>/`` folder out of an apworld into ``destination``.
 
@@ -960,9 +976,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true", help="resolve and report without writing to --output")
     parser.add_argument(
-        "--import-check",
+        "--validate",
         action="store_true",
-        help="after installing, import worlds/ in a subprocess to confirm core loads them "
+        help="after installing, run Archipelago's own start-up checks in a subprocess and remove "
+        "whatever they reject, including worlds that break the WebHost's option templates "
         "(this executes the downloaded third-party code)",
     )
     parser.add_argument("--report", type=Path, help="write a detailed JSON report to this path")
@@ -1001,6 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prune=args.prune,
         install_mode=args.install_mode,
         ignore_game_mismatch=args.ignore_game_mismatch,
+        validate=args.validate,
         webhost_check=args.webhost_check,
         max_asset_bytes=args.max_asset_bytes,
     )
@@ -1022,11 +1040,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("could not read the wiki category: %s", error)
         return 2
 
+    exit_code = 0
+    if options.validate and not options.dry_run:
+        passed, detail = crawler.validate_and_remove()
+        if not passed:
+            logger.error("validation could not run: %s", detail)
+            exit_code = 1
+        elif detail:
+            logger.info(detail)
+
     log_summary(records)
     if args.report:
         write_report(args.report, records)
 
-    exit_code = 0
     if not options.dry_run:
         write_lockfile(
             options.lockfile,
@@ -1036,11 +1062,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             previously_installed=crawler.previous,
             previously_rejected=crawler.rejected,
         )
-        if args.import_check:
-            passed, detail = run_import_check(root)
-            if not passed:
-                logger.error("import check failed: %s", detail)
-                exit_code = 1
 
     if args.strict and any(not record.succeeded for record in records):
         exit_code = 1

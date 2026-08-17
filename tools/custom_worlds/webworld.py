@@ -155,9 +155,23 @@ def _check_world(path: str, name: str, node: ast.ClassDef, package: "_Package") 
                 severity=SEVERITY_LOAD,
                 world_class=name,
             )
-        webworld = package.class_def(owner, _name_of(value.func) or "")
+        callee = _name_of(value.func) or ""
+        webworld = package.class_def(owner, callee)
         if webworld is not None:
             return _check_tutorials(name, webworld, package)
+        if callee == _WEBWORLD_BASE:
+            # web = WebWorld() instantiates core's base directly, and that is the very class whose
+            # bare "tutorials" annotation the WebHost's hasattr check exists to reject.
+            return WebWorldFinding(
+                code=WEB_NO_TUTORIALS,
+                detail=(
+                    f"{name} sets web = WebWorld(), which is core's base class and defines no "
+                    f"'tutorials', {_DROPPED_BY_WEBHOST}; it needs a WebWorld subclass carrying a "
+                    "Tutorial block"
+                ),
+                severity=SEVERITY_WEBHOST,
+                world_class=name,
+            )
         return None
 
     if isinstance(value, ast.Name):
@@ -204,6 +218,10 @@ def _check_tutorials(world_name: str, webworld: "_Class", package: "_Package") -
     web_name = webworld.name
 
     if found is None or found.value is None:
+        # "self.tutorials = ..." in __init__ satisfies the WebHost too: its check is hasattr on the
+        # instance held in World.web, not on the class.
+        if package.sets_instance_attribute(webworld.module, webworld.node, _TUTORIALS):
+            return None
         if package.patches_attribute(webworld.module, web_name, _TUTORIALS) or package.inherits_from_outside(
             webworld.module, webworld.node
         ):
@@ -463,6 +481,38 @@ class _Package:
             if origin is None or not self.is_unknown(origin, name):
                 return False
         return True
+
+    def sets_instance_attribute(self, module: str, node: ast.ClassDef, attribute: str, depth: int = 0) -> bool:
+        """Whether any method of the class assigns ``self.<attribute>``.
+
+        The WebHost asks ``hasattr(world.web, "tutorials")`` of the *instance*, so a tutorials list
+        built in ``__init__`` counts just as much as one declared in the class body.
+        """
+        for statement in node.body:
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(statement):
+                targets: list[ast.expr] = []
+                if isinstance(inner, ast.Assign):
+                    targets = list(inner.targets)
+                elif isinstance(inner, (ast.AnnAssign, ast.AugAssign)):
+                    targets = [inner.target]
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and target.attr == attribute
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                    ):
+                        return True
+
+        if depth <= _MAX_DEPTH:
+            for _name, resolved in self.bases(module, node):
+                if resolved is not None and self.sets_instance_attribute(
+                    resolved.module, resolved.node, attribute, depth + 1
+                ):
+                    return True
+        return False
 
     def patches_attribute(self, module: str, class_name: str, attribute: str) -> bool:
         """Whether any reachable module assigns ``<class>.<attribute>`` from outside the class body."""
