@@ -16,6 +16,9 @@ in a subprocess, and reports a verdict per game:
 3. ``Options.generate_yaml_templates`` - the WebHost calls this through ``create_options_files()``
    before it serves anything, and it raises on the first world it cannot render. One bad world here
    does not get dropped; it stops the whole server from starting.
+4. ``copy_tutorials_files_to_static`` - the step after that, which lists every non-hidden world's
+   ``docs`` folder. A world installed as a folder without one raises FileNotFoundError, and again
+   the whole site fails to start rather than the one game.
 
 Step 3 is why this exists at all. It is run per world, with the registry temporarily narrowed to one
 game, so a single failure names the game responsible instead of aborting the sweep.
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 FAILED_TO_LOAD = "failed-to-load"
 INVALID_FOR_WEBHOST = "invalid-for-webhost"
 TEMPLATE_FAILED = "template-failed"
+DOCS_MISSING = "docs-missing"
 
 #: How long to let the subprocess run. Importing several hundred worlds is not quick.
 DEFAULT_TIMEOUT = 900.0
@@ -137,6 +141,21 @@ with tempfile.TemporaryDirectory() as folder:
             })
         finally:
             AutoWorldRegister.world_types = registry
+
+# copy_tutorials_files_to_static() is the next thing WebHost.py calls, and it does a bare
+# os.listdir() on each non-hidden world's docs folder. A world installed as a folder without one
+# raises FileNotFoundError and the site never finishes starting.
+for game, world in remaining.items():
+    if getattr(world, "zip_path", None) or getattr(world, "hidden", False):
+        continue
+    folder = os.path.join(os.path.dirname(getattr(world, "__file__", "") or ""), "docs")
+    if not os.path.isdir(folder):
+        verdicts.append({
+            "game": game,
+            "module": module_of(world),
+            "status": "docs-missing",
+            "reason": "no docs/ folder, so copy_tutorials_files_to_static() raises at start-up",
+        })
 
 emit({"registered": len(registry), "verdicts": verdicts})
 """

@@ -30,6 +30,8 @@ from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
 from .validate import validate_installed_worlds
 from .verify import (
+    MAX_MODULE_BYTES,
+    MAX_SOURCE_BYTES,
     STATUS_INVALID,
     STATUS_OK,
     WEBHOST_ERROR,
@@ -40,6 +42,7 @@ from .verify import (
     find_conflicts,
     verify_apworld,
 )
+from .webworld import module_path, patch_endings, world_game
 from .wiki import (
     DEFAULT_API_URL,
     DEFAULT_CATEGORY,
@@ -76,7 +79,7 @@ _FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED, OUTCOME_KNOWN_BA
 #: Bumped whenever the checks change their mind about what is acceptable. Lockfile entries written
 #: by an older version are re-verified rather than trusted, so a new check reaches worlds that were
 #: installed before it existed.
-CHECKS_VERSION = 3
+CHECKS_VERSION = 4
 
 
 @dataclass
@@ -309,7 +312,13 @@ class Crawler:
         staged.parent.mkdir(parents=True, exist_ok=True)
         staged.write_bytes(payload)
 
-        result = verify_apworld(staged, self.versions, webhost_check=self.options.webhost_check)
+        result = verify_apworld(
+            staged,
+            self.versions,
+            webhost_check=self.options.webhost_check,
+            # A missing docs/ folder only stops the WebHost when the world is a folder it lists.
+            check_docs=self.options.install_mode == INSTALL_EXTRACT,
+        )
         record.verification = result.status
         record.errors.extend(result.errors)
         record.warnings.extend(result.warnings)
@@ -585,7 +594,13 @@ class Crawler:
 
     def _apply_conflicts(self, verified: dict[Path, tuple[GameRecord, VerificationResult]]) -> None:
         results = [result for _record, result in verified.values()]
-        conflicts = find_conflicts(results, self._existing_world_names())
+        games, endings = self._existing_registrations()
+        conflicts = find_conflicts(
+            results,
+            self._existing_world_names(),
+            existing_games=games,
+            existing_endings=endings,
+        )
         for path, messages in conflicts.items():
             record = verified[path][0]
             record.outcome = OUTCOME_SKIPPED
@@ -612,6 +627,38 @@ class Crawler:
             elif entry.is_file() and entry.suffix == ".apworld":
                 names.add(entry.stem)
         return names
+
+    def _existing_registrations(self) -> tuple[dict[str, str], dict[str, str]]:
+        """The game names and patch extensions this checkout's own worlds already register.
+
+        Both are process-wide registries that do not care which world got there first, so a custom
+        world claiming either one takes a world out - and since ``worlds/`` loads alphabetically, the
+        one it takes out can be Archipelago's. That is what happened to core's Gauntlet Legends: a
+        custom ``gauntlet_legends`` claimed ``.apgl`` and ``gl`` failed to import behind it.
+
+        Read from the source rather than by importing, like everything else here, and only from the
+        folder worlds this checkout ships - anything a previous run installed is excluded, because
+        re-installing it is the point rather than a clash.
+        """
+        games: dict[str, str] = {}
+        endings: dict[str, str] = {}
+        worlds_dir = self.options.root / "worlds"
+        if not worlds_dir.is_dir():
+            return games, endings
+        managed = {Path(str(entry["file"])).stem for entry in self.previous.values() if entry.get("file")}
+
+        for entry in sorted(worlds_dir.iterdir()):
+            if entry.name.startswith((".", "_")) or entry.name in managed or not entry.is_dir():
+                continue
+            if not (entry / "__init__.py").is_file():
+                continue
+            modules = _read_world_folder(entry)
+            for ending in patch_endings(modules):
+                endings.setdefault(ending, entry.name)
+            game = world_game(modules)
+            if game:
+                games.setdefault(game, entry.name)
+        return games, endings
 
     def _install(self, verified: dict[Path, tuple[GameRecord, VerificationResult]]) -> None:
         output = self.options.output_dir
@@ -851,6 +898,29 @@ def log_summary(records: Sequence[GameRecord]) -> None:
                 record.asset_name,
                 record.game or "no game in manifest",
             )
+
+
+def _read_world_folder(folder: Path) -> dict[str, str]:
+    """The Python modules of a world installed as a folder, keyed the way the checks expect.
+
+    Capped the same way the apworld reader is: a world that ships a huge generated data module has
+    nothing to say about its registrations, and reading it would only slow the run down.
+    """
+    modules: dict[str, str] = {}
+    budget = MAX_SOURCE_BYTES
+    for source in sorted(folder.rglob("*.py")):
+        dotted = module_path(source.relative_to(folder).as_posix())
+        if dotted is None:
+            continue
+        try:
+            size = source.stat().st_size
+            if size > MAX_MODULE_BYTES or size > budget:
+                continue
+            modules[dotted] = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        budget -= size
+    return modules
 
 
 def extract_world(archive: Path, destination: Path) -> None:

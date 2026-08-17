@@ -11,9 +11,13 @@ import unittest
 from pathlib import Path
 
 from tools.custom_worlds.webworld import (
+    BAD_ESCAPE,
+    DOCS_MISSING,
     PRESETS_NOT_NESTED,
     ROOT,
+    SETTINGS_UNRESOLVABLE,
     SEVERITY_LOAD,
+    SEVERITY_NOTE,
     SEVERITY_WEBHOST,
     TUTORIALS_NOT_A_LIST,
     UNPARSEABLE,
@@ -24,6 +28,8 @@ from tools.custom_worlds.webworld import (
     inspect_source,
     inspect_world,
     module_path,
+    patch_endings,
+    world_game,
 )
 
 WORLD_HEADER = "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
@@ -499,6 +505,134 @@ class TestOptionsPresets(WebWorldTestCase):
         self.assertEqual([], codes)
 
 
+class TestDocsFolder(WebWorldTestCase):
+    """WebHost.py lists each world's docs/ at start-up, and one missing folder stops the site."""
+
+    GOOD = world("web = MyGameWeb()")
+
+    def codes_with(self, files: list[str] | None) -> list[str]:
+        return [f.code for f in inspect_world({ROOT: self.GOOD}, module_name="mygame", files=files)]
+
+    def test_tutorials_without_a_docs_folder_are_reported(self) -> None:
+        finding = inspect_world({ROOT: self.GOOD}, module_name="mygame", files=["__init__.py"])[0]
+        self.assertEqual(DOCS_MISSING, finding.code)
+        self.assertEqual(SEVERITY_WEBHOST, finding.severity)
+        self.assertIn("os.listdir", finding.detail)
+
+    def test_a_docs_folder_satisfies_it(self) -> None:
+        self.assertEqual([], self.codes_with(["__init__.py", "docs/setup_en.md"]))
+
+    def test_a_caller_that_cannot_list_the_package_stays_quiet(self) -> None:
+        # No file list means no evidence, and a guess here would delete a working world.
+        self.assertEqual([], self.codes_with(None))
+
+    def test_a_hidden_world_needs_no_docs(self) -> None:
+        source = world("web = MyGameWeb()\nhidden = True")
+        findings = inspect_world({ROOT: source}, module_name="mygame", files=["__init__.py"])
+        self.assertEqual([], [f.code for f in findings])
+
+    def test_a_world_with_no_tutorials_is_reported_for_that_instead(self) -> None:
+        # It never reaches the docs copy, so naming docs too would just be noise.
+        source = world("options_dataclass = None", web_class=False)
+        findings = inspect_world({ROOT: source}, module_name="mygame", files=["__init__.py"])
+        self.assertEqual([WEB_MISSING], [f.code for f in findings])
+
+
+class TestSettingsAnnotation(WebWorldTestCase):
+    """core resolves a string 'settings' annotation by stripping exactly one layer of brackets."""
+
+    FUTURE = "from __future__ import annotations\nfrom typing import ClassVar\n"
+
+    def annotate(self, annotation: str, *, future: bool = True) -> list[str]:
+        header = (self.FUTURE if future else "from typing import ClassVar\n") + WORLD_HEADER
+        source = world(f"web = MyGameWeb()\nsettings: {annotation}", header=header)
+        return self.codes(source)
+
+    def test_a_doubly_nested_annotation_is_reported(self) -> None:
+        self.assertEqual([SETTINGS_UNRESOLVABLE], self.annotate("ClassVar[type[MySettings]]"))
+
+    def test_the_ordinary_shape_is_accepted(self) -> None:
+        self.assertEqual([], self.annotate("ClassVar[MySettings]"))
+
+    def test_a_bare_class_is_accepted(self) -> None:
+        self.assertEqual([], self.annotate("MySettings"))
+
+    def test_a_dotted_annotation_is_reported_only_as_a_string(self) -> None:
+        # core's sc2 writes exactly this and is fine, because without the future import the
+        # annotation is an object and typing.get_args resolves it. Only the string branch breaks.
+        self.assertEqual([], self.annotate("ClassVar[settings.MySettings]", future=False))
+        self.assertEqual([SETTINGS_UNRESOLVABLE], self.annotate("ClassVar[settings.MySettings]"))
+
+    def test_an_explicit_string_annotation_counts_without_the_future_import(self) -> None:
+        self.assertEqual([SETTINGS_UNRESOLVABLE], self.annotate('"ClassVar[type[MySettings]]"', future=False))
+
+
+class TestInvalidEscapes(WebWorldTestCase):
+    def test_a_bad_escape_is_reported_as_a_note(self) -> None:
+        source = world("web = MyGameWeb()\n" + r'link = "setup\en"')
+        findings = inspect_source(source, module_name="mygame")
+        self.assertEqual([BAD_ESCAPE], [f.code for f in findings])
+        self.assertEqual(SEVERITY_NOTE, findings[0].severity)
+        self.assertIn("__init__.py line", findings[0].detail)
+
+    def test_a_real_escape_is_not_reported(self) -> None:
+        self.assertEqual([], self.codes(world("web = MyGameWeb()\n" + r'text = "a\nb\\c"')))
+
+    def test_a_raw_string_is_not_reported(self) -> None:
+        self.assertEqual([], self.codes(world('web = MyGameWeb()\npath = r"setup\\en"')))
+
+
+class TestPatchEndings(unittest.TestCase):
+    """AutoPatchRegister keys patch extensions globally, on the class's own 'game' attribute."""
+
+    def test_a_registered_ending_is_found(self) -> None:
+        modules = {ROOT: 'class P:\n    game = "G"\n    patch_file_ending = ".apgl"\n'}
+        self.assertEqual({".apgl"}, patch_endings(modules))
+
+    def test_a_class_without_its_own_game_never_registers(self) -> None:
+        # core checks "game" in dct, so an inherited game does not put the class in the registry.
+        modules = {ROOT: 'class Base:\n    game = "G"\nclass P(Base):\n    patch_file_ending = ".apx"\n'}
+        self.assertEqual(set(), patch_endings(modules))
+
+    def test_zip_is_ignored(self) -> None:
+        # core raises on ".zip" before the registry, so it can never be the thing two worlds share.
+        modules = {ROOT: 'class P:\n    game = "G"\n    patch_file_ending = ".zip"\n'}
+        self.assertEqual(set(), patch_endings(modules))
+
+    def test_a_module_the_world_never_imports_still_counts(self) -> None:
+        # Reached or not, the class registers as soon as its module is executed.
+        modules = {ROOT: "", "Rom": 'class P:\n    game = "G"\n    patch_file_ending = ".apx"\n'}
+        self.assertEqual({".apx"}, patch_endings(modules))
+
+    def test_core_declares_the_endings_it_actually_registers(self) -> None:
+        root = Path(__file__).resolve().parents[2] / "worlds"
+        found: dict[str, set[str]] = {}
+        for world_dir in sorted(root.iterdir()):
+            if not world_dir.is_dir() or world_dir.name.startswith(("_", ".")):
+                continue
+            if not (world_dir / "__init__.py").exists():
+                continue
+            endings = patch_endings(_package_of(world_dir))
+            if endings:
+                found[world_dir.name] = endings
+        self.assertEqual({".apgl"}, found.get("gl"), "core's Gauntlet Legends registers .apgl")
+        # Core boots, so nothing it ships may collide with anything else it ships.
+        seen: dict[str, str] = {}
+        for name, endings in found.items():
+            for ending in endings:
+                self.assertNotIn(ending, seen, f"{name} and {seen.get(ending)} both claim {ending}")
+                seen[ending] = name
+
+
+class TestWorldGame(unittest.TestCase):
+    def test_the_registered_game_is_read(self) -> None:
+        self.assertEqual("My Game", world_game({ROOT: world("web = MyGameWeb()")}))
+
+    def test_a_game_built_at_runtime_is_not_guessed_at(self) -> None:
+        source = world("web = MyGameWeb()", header=WORLD_HEADER).replace('game = "My Game"', "game = make_name()")
+        self.assertEqual("", world_game({ROOT: source}))
+
+
 class TestAgainstTheBundledWorlds(unittest.TestCase):
     """Every world shipped with Archipelago should pass, which is the false-positive check."""
 
@@ -513,7 +647,9 @@ class TestAgainstTheBundledWorlds(unittest.TestCase):
             if not (world_dir / "__init__.py").exists():
                 continue
             inspected += 1
-            findings = inspect_world(_package_of(world_dir), module_name=name)
+            # With the real file list, so the docs/ check is exercised against real worlds too.
+            files = [item.relative_to(world_dir).as_posix() for item in world_dir.rglob("*")]
+            findings = inspect_world(_package_of(world_dir), module_name=name, files=files)
             if findings:
                 problems[name] = [finding.code for finding in findings]
         self.assertGreater(inspected, 20, "expected to find the bundled worlds")

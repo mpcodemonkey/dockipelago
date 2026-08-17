@@ -36,13 +36,18 @@ list built by a function - all of these stay quiet, because a false positive cos
 """
 
 import ast
-from collections.abc import Iterator, Mapping
+import warnings
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
+
+_INVALID_ESCAPE = "invalid escape sequence"
 
 #: Archipelago will not load the world at all.
 SEVERITY_LOAD = "load"
 #: The world loads, but ``WebHost.py`` drops it from the site and the data package.
 SEVERITY_WEBHOST = "webhost"
+#: Worth saying out loud, but never a reason to refuse a world: it serves, with something degraded.
+SEVERITY_NOTE = "note"
 
 #: The world assigns the WebWorld class rather than an instance.
 WEB_NOT_INSTANTIATED = "web-not-instantiated"
@@ -58,6 +63,12 @@ WEB_NO_TUTORIALS = "web-no-tutorials"
 TUTORIALS_NOT_A_LIST = "tutorials-not-a-list"
 #: ``options_presets`` maps preset names to scalars rather than to option dictionaries.
 PRESETS_NOT_NESTED = "presets-not-nested"
+#: The world has tutorials but ships no ``docs/`` folder for the WebHost to copy.
+DOCS_MISSING = "docs-missing"
+#: The ``settings`` annotation is one core's own resolver cannot turn back into a class.
+SETTINGS_UNRESOLVABLE = "settings-unresolvable"
+#: A string literal contains an escape Python does not recognise, such as ``"setup\\en"``.
+BAD_ESCAPE = "bad-escape"
 
 ROOT = ""  # the world package itself, i.e. <name>/__init__.py
 
@@ -66,6 +77,10 @@ _WEBWORLD_BASE = "WebWorld"
 _TUTORIALS = "tutorials"
 _PRESETS = "options_presets"
 _WEB = "web"
+_HIDDEN = "hidden"
+_SETTINGS = "settings"
+_DOCS = "docs"
+_PATCH_ENDING = "patch_file_ending"
 _MAX_DEPTH = 10
 
 _DROPPED_BY_WEBHOST = (
@@ -112,10 +127,18 @@ def inspect_source(source: str, *, module_name: str = "") -> list[WebWorldFindin
     return inspect_world({ROOT: source}, module_name=module_name)
 
 
-def inspect_world(modules: Mapping[str, str], *, module_name: str = "") -> list[WebWorldFinding]:
+def inspect_world(
+    modules: Mapping[str, str],
+    *,
+    module_name: str = "",
+    files: Collection[str] | None = None,
+) -> list[WebWorldFinding]:
     """Report WebWorld problems provable from a world's source.
 
     ``modules`` maps dotted module paths - as produced by :func:`module_path` - to their source.
+    ``files`` is every path inside the world folder, Python or not, which is what the ``docs/``
+    check needs. It is optional: a caller that cannot enumerate the package has nothing to say
+    about a missing folder, and silence beats a guess.
     """
     label = module_name or "the world"
     package = _Package(modules)
@@ -149,11 +172,228 @@ def inspect_world(modules: Mapping[str, str], *, module_name: str = "") -> list[
                 )
             )
 
+    findings.extend(_check_escapes(label, package))
+
+    has_docs = _has_docs(files)
     for path, name, node in package.world_classes():
         finding = _check_world(path, name, node, package)
         if finding is not None:
             findings.append(finding)
+        if has_docs is False:
+            docs = _check_docs(label, path, name, node, package, finding)
+            if docs is not None:
+                findings.append(docs)
+        settings = _check_settings(path, name, node, package)
+        if settings is not None:
+            findings.append(settings)
     return findings
+
+
+def patch_endings(modules: Mapping[str, str]) -> set[str]:
+    """Every ``patch_file_ending`` a world's patch containers claim.
+
+    ``AutoPatchRegister`` keys these globally and raises ``ImproperlyConfiguredAutoPatchError`` the
+    moment a second class claims one that is taken, so the loser fails to import. The loser is
+    whichever loads later, which is alphabetical - a custom world can and does knock out one of
+    Archipelago's own this way.
+
+    Read from every module in the package, reachable or not: a patch container registers itself as
+    soon as its class statement executes, and worlds keep them in files like ``Rom.py`` that
+    ``__init__`` imports for their side effects.
+
+    Registration is keyed on ``"game" in dct`` - the class's *own* body, not anything inherited - so
+    that is the condition mirrored here. It matters: core's factorio, kh1 and kh2 all name ``.zip``
+    on classes that inherit ``game`` rather than setting it, so they never register and never clash.
+    ``.zip`` is skipped regardless, since core raises on it before it reaches the registry.
+    """
+    endings: set[str] = set()
+    package = _Package(modules)
+    for path in modules:
+        index = package.index(path)
+        if index is None:
+            continue
+        for node in index.classes.values():
+            if _own_attribute(node, "game") is None:
+                continue
+            value = _own_attribute(node, _PATCH_ENDING)
+            if isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value != ".zip":
+                endings.add(value.value)
+    return endings
+
+
+def _own_attribute(node: ast.ClassDef, attribute: str) -> ast.expr | None:
+    """A value assigned in this class's own body, which is all that reaches a metaclass's ``dct``."""
+    for statement in node.body:
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name) and target.id == attribute:
+                    return statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            if isinstance(statement.target, ast.Name) and statement.target.id == attribute:
+                return statement.value
+    return None
+
+
+def world_game(modules: Mapping[str, str]) -> str:
+    """The ``game`` a world registers itself under, or "" when the source does not say plainly.
+
+    ``AutoWorldRegister`` keys on ``dct["game"]`` - the class's own body - and raises RuntimeError if
+    that name is taken, so this mirrors the same rule. A game name built at runtime returns "",
+    since a guess here would cost a world.
+    """
+    package = _Package(modules)
+    for path, _name, node in package.world_classes():
+        value = _own_attribute(node, "game")
+        if value is None:
+            continue
+        resolved = package.value_of(path, value).value
+        if isinstance(resolved, ast.Constant) and isinstance(resolved.value, str):
+            return resolved.value
+    return ""
+
+
+def _has_docs(files: Collection[str] | None) -> bool | None:
+    """Whether the world ships a ``docs/`` folder, or None when the caller could not say."""
+    if files is None:
+        return None
+    return any(name == f"{_DOCS}/" or name.startswith(f"{_DOCS}/") for name in files)
+
+
+def _check_docs(
+    label: str,
+    path: str,
+    name: str,
+    node: ast.ClassDef,
+    package: "_Package",
+    web_finding: WebWorldFinding | None,
+) -> WebWorldFinding | None:
+    """A world the WebHost will publish tutorials for must ship the folder it copies them from.
+
+    ``copy_tutorials_files_to_static()`` runs at start-up, after the options templates, and for every
+    non-hidden world with a ``web.tutorials`` it does a bare ``os.listdir(<world>/docs)``. There is
+    no try/except: one world missing the folder raises FileNotFoundError and the WebHost never
+    finishes starting.
+
+    This only bites worlds installed as folders. The zip branch above it walks the archive's entries
+    and copies the ones under ``docs/``, so an ``.apworld`` without any simply contributes nothing -
+    which is why this is checked against the install mode rather than reported unconditionally.
+    """
+    if web_finding is not None and web_finding.code in _NO_TUTORIALS_REACHED:
+        return None  # the world has no usable tutorials list, which is already the finding
+    if _is_hidden(path, node, package):
+        return None
+    if package.find_attribute(path, node, _WEB) is None:
+        return None
+    return WebWorldFinding(
+        code=DOCS_MISSING,
+        detail=(
+            f"{name} has tutorials but {label} ships no 'docs/' folder. WebHost.py copies each "
+            "world's docs to its static folder at start-up with a bare os.listdir(), so the "
+            "missing folder raises FileNotFoundError and the site never starts"
+        ),
+        severity=SEVERITY_WEBHOST,
+        world_class=name,
+    )
+
+
+#: Findings that mean the world never reaches the tutorial copy at all, so docs cannot be the issue.
+_NO_TUTORIALS_REACHED = frozenset(
+    {WEB_NOT_INSTANTIATED, WEB_UNDEFINED, WEB_MISSING, WEB_NO_TUTORIALS, TUTORIALS_NOT_A_LIST}
+)
+
+
+def _is_hidden(path: str, node: ast.ClassDef, package: "_Package") -> bool:
+    """``hidden = True`` keeps a world off the site, and out of the tutorial copy with it."""
+    found = package.find_attribute(path, node, _HIDDEN)
+    if found is None or found.value is None:
+        return False
+    value = package.value_of(found.module, found.value).value
+    return isinstance(value, ast.Constant) and value.value is True
+
+
+def _check_settings(
+    path: str, name: str, node: ast.ClassDef, package: "_Package"
+) -> WebWorldFinding | None:
+    """``settings`` has to be annotated in the one shape core's resolver can read back.
+
+    Only when the annotation reaches core as a *string*, which is the branch this is about.
+    ``settings.py`` reads ``world.__annotations__["settings"]`` and, for a string, does not evaluate
+    it. It takes the text, strips a single layer of brackets, and hands the remainder to ``getattr``
+    on the world's module::
+
+        cls_name = cls_or_name
+        if "[" in cls_name:
+            cls_name = cls_name.split("[", 1)[1].rsplit("]", 1)[0]
+        cls = getattr(__import__(world_mod, fromlist=[cls_name]), cls_name)
+
+    One layer. ``ClassVar[MySettings]`` works; ``ClassVar[type[MySettings]]`` leaves
+    ``type[MySettings]``, which is not a name any module has, and the lookup raises AttributeError
+    when the settings file is next written. Rather than guess at the shapes, this runs core's two
+    lines and asks whether what falls out could be a name at all.
+
+    Without ``from __future__ import annotations`` the annotation arrives as a real object instead
+    and core resolves it with ``typing.get_args``, which handles nesting and dotted names perfectly
+    well - core's own sc2 writes ``ClassVar[settings.Starcraft2Settings]`` and is fine. Reporting
+    that would be a false positive, so the string branch is a precondition, not a detail.
+    """
+    annotation = package.find_annotation(path, node, _SETTINGS)
+    if annotation is None:
+        return None
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        written = annotation.value  # settings: "ClassVar[...]" is a string whatever the module does
+    elif package.string_annotations(path):
+        written = ast.unparse(annotation)
+    else:
+        return None
+    resolved = _core_settings_name(written)
+    if resolved.isidentifier():
+        return None
+    return WebWorldFinding(
+        code=SETTINGS_UNRESOLVABLE,
+        detail=(
+            f"{name} annotates settings as '{written}', which core reduces to '{resolved}' - not a "
+            "name it can look up, so reading or saving this world's settings raises AttributeError. "
+            "core strips one layer of brackets only, so it needs 'ClassVar[MySettings]' rather than "
+            "'ClassVar[type[MySettings]]'"
+        ),
+        severity=SEVERITY_NOTE,
+        world_class=name,
+    )
+
+
+def _core_settings_name(annotation: str) -> str:
+    """``settings.Settings.__getattribute__``'s own reduction, kept identical to it on purpose."""
+    if "[" in annotation:
+        return annotation.split("[", 1)[1].rsplit("]", 1)[0]
+    return annotation
+
+
+def _check_escapes(label: str, package: "_Package") -> list[WebWorldFinding]:
+    """Report string literals carrying escapes Python does not recognise.
+
+    ``"setup\\en"`` is meant to be ``"setup/en"``. Python keeps the backslash and warns, so the world
+    still loads - with a SyntaxWarning on every start-up and a tutorial link pointing nowhere.
+    """
+    findings = []
+    for path in package.reachable():
+        for lineno, message in package.escapes.get(path, []):
+            findings.append(
+                WebWorldFinding(
+                    code=BAD_ESCAPE,
+                    detail=(
+                        f"{label}/{_file_name(path)} line {lineno}: {message}. Python warns and "
+                        "keeps the backslash, so the string is not what it looks like - a tutorial "
+                        r"link written 'setup\en' needs to be 'setup/en'"
+                    ),
+                    severity=SEVERITY_NOTE,
+                )
+            )
+    return findings
+
+
+def _file_name(path: str) -> str:
+    """The file a dotted module path came from, for messages that point at something openable."""
+    return f"{path.replace('.', '/')}.py" if path else "__init__.py"
 
 
 def _check_world(path: str, name: str, node: ast.ClassDef, package: "_Package") -> WebWorldFinding | None:
@@ -362,6 +602,13 @@ class _ModuleIndex:
         self.star_imports: list[str | None] = []
         self.assigned: dict[str, ast.expr] = {}
         self.functions: set[str] = set()
+        #: "from __future__ import annotations" makes every annotation here a plain string at
+        #: runtime, which is what decides how core reads this module's 'settings'.
+        self.string_annotations = any(
+            isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names)
+            for node in tree.body
+        )
         #: Attributes given to a class from outside its body, e.g. "MyWorld.web = MyWeb()".
         self.patched: dict[str, set[str]] = {}
 
@@ -410,6 +657,7 @@ class _Package:
     def __init__(self, sources: Mapping[str, str]) -> None:
         self.sources = sources
         self.errors: dict[str, SyntaxError] = {}
+        self.escapes: dict[str, list[tuple[int, str]]] = {}
         self._indexes: dict[str, _ModuleIndex | None] = {}
 
     # -- module plumbing ---------------------------------------------------------------
@@ -428,10 +676,22 @@ class _Package:
         try:
             # Python strips a UTF-8 BOM when it imports a file; ast.parse does not, and would
             # otherwise reject a perfectly importable module for its first character.
-            tree = ast.parse(source.lstrip("\ufeff"))
+            with warnings.catch_warnings(record=True) as raised:
+                warnings.simplefilter("always")
+                tree = ast.parse(source.lstrip("\ufeff"))
         except SyntaxError as error:
             self.errors[path] = error
             return None
+        # Matched on the message rather than the category: the same complaint is a DeprecationWarning
+        # before Python 3.12 and a SyntaxWarning from 3.12 on, and the crawler need not be running
+        # the interpreter the image will.
+        found = [
+            (raised_warning.lineno, str(raised_warning.message))
+            for raised_warning in raised
+            if _INVALID_ESCAPE in str(raised_warning.message)
+        ]
+        if found:
+            self.escapes[path] = found
         index = _ModuleIndex(path, tree, self)
         self._indexes[path] = index
         return index
@@ -723,6 +983,30 @@ class _Package:
             for _name, resolved in self.bases(module, node):
                 if resolved is not None:
                     found = self.find_attribute(resolved.module, resolved.node, attribute, depth + 1)
+                    if found is not None:
+                        return found
+        return None
+
+    def string_annotations(self, module: str) -> bool:
+        """Whether this module's annotations reach core as strings rather than objects."""
+        index = self.index(module)
+        return index is not None and index.string_annotations
+
+    def find_annotation(self, module: str, node: ast.ClassDef, attribute: str, depth: int = 0) -> ast.expr | None:
+        """The *annotation* on a class attribute, which is what core reads for ``settings``.
+
+        Distinct from :meth:`find_attribute`, which wants the assigned value: here the annotation is
+        the whole point, and an attribute assigned without one has nothing to check.
+        """
+        for statement in node.body:
+            if isinstance(statement, ast.AnnAssign):
+                if isinstance(statement.target, ast.Name) and statement.target.id == attribute:
+                    return statement.annotation
+
+        if depth <= _MAX_DEPTH:
+            for _name, resolved in self.bases(module, node):
+                if resolved is not None:
+                    found = self.find_annotation(resolved.module, resolved.node, attribute, depth + 1)
                     if found is not None:
                         return found
         return None

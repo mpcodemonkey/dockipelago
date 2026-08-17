@@ -209,6 +209,20 @@ from one that was never written — which is the right answer, since that is exa
 too. `tutorials = []` is accepted, because core accepts it. `tutorials = Tutorial(...)` without the
 brackets is rejected, since the WebHost iterates the attribute.
 
+A world with tutorials must also ship the `docs/` folder they live in. `copy_tutorials_files_to_static()`
+runs at start-up, right after the option templates, and for every non-hidden world it does a bare
+`os.listdir(<world>/docs)` — no try/except, so one missing folder takes the whole site down:
+
+```
+File "/app/WebHost.py", line 92, in copy_tutorials_files_to_static
+    files = os.listdir(source_path)
+FileNotFoundError: [Errno 2] No such file or directory: '/app/worlds/DuckLife4/docs'
+```
+
+This one depends on the install mode, and is only checked under `--install-mode extract` (the
+default). The zip branch of the same function walks the archive's entries and copies those under
+`docs/`, so an `.apworld` without any contributes nothing instead of raising.
+
 **The world loads, but the WebHost never finishes starting.** One shape is worse than being dropped:
 
 ```python
@@ -230,6 +244,43 @@ first group.
 
 Refusing them also means **taking back out** any copy an earlier run installed — see
 [Rejected worlds](#rejected-worlds) below.
+
+### Reported, but never a reason to refuse a world
+
+Two more are recorded as warnings. The world serves; something about it is degraded, and no policy
+setting turns either into a rejection.
+
+**A `settings` annotation core cannot read back.** `settings.py` does not evaluate the annotation.
+When it arrives as a string it takes the text, strips exactly one layer of brackets, and hands what
+is left to `getattr` on the world's module:
+
+```python
+cls_name = cls_or_name
+if "[" in cls_name:
+    cls_name = cls_name.split("[", 1)[1].rsplit("]", 1)[0]
+cls = getattr(__import__(world_mod, fromlist=[cls_name]), cls_name)
+```
+
+One layer. `ClassVar[MySettings]` works; `ClassVar[type[MySettings]]` leaves `type[MySettings]`,
+which is not a name any module has, so the world's settings raise `AttributeError` whenever they are
+read or saved. Rather than guess at shapes, the check runs those two lines and asks whether what
+falls out could be a name at all.
+
+The annotation only reaches core as a string under `from __future__ import annotations`, or when it
+is written as a string literal. Without that it arrives as an object and `typing.get_args` resolves
+it, nesting and dotted names included — core's own sc2 writes `ClassVar[settings.Starcraft2Settings]`
+and is perfectly fine. So the string branch is a precondition for reporting this, not a detail.
+
+**A backslash that is not an escape.** `"setup\en"` is meant to be `"setup/en"`. Python keeps the
+backslash and warns, so the world loads with a broken tutorial link and a warning on every start-up:
+
+```
+worlds/cursed_words/__init__.py:19: SyntaxWarning: invalid escape sequence '\e'
+```
+
+These are matched on the warning's message rather than its category, since the same complaint is a
+`DeprecationWarning` before Python 3.12 and a `SyntaxWarning` from 3.12 on — and the crawler need
+not be running the interpreter the image will.
 
 ### The whole world is read, not just `__init__.py`
 
@@ -263,7 +314,28 @@ Two more checks only make sense once several worlds are installed together, and 
 they fire:
 
 - a world whose module name would shadow one that already ships with Archipelago;
-- two worlds claiming the same module name or the same `game`, where core silently loads only one.
+- two worlds claiming the same module name or the same `game`, where core silently loads only one;
+- a world claiming a `game` that a core world already registers — `AutoWorldRegister` raises
+  `RuntimeError` on the second world to claim a name;
+- a world claiming a `patch_file_ending` that is already taken.
+
+That last one is worth spelling out, because it is how a custom world takes out one of Archipelago's
+own. `AutoPatchRegister` keys patch extensions in a single process-wide dict and raises on the
+second class to claim one:
+
+```
+worlds.Files.ImproperlyConfiguredAutoPatchError: Two auto patch containers are using the same file
+extension: <class 'worlds.gl.Rom.GLProcedurePatch'>, <class 'worlds.gauntlet_legends.Rom.GLDeltaPatch'>
+```
+
+`worlds/` loads alphabetically, so `gauntlet_legends` got `.apgl` first and core's own `gl` — the
+Gauntlet Legends world that ships with Archipelago — is the one that failed to import. The registry
+does not care which side shipped with core, so both directions are checked.
+
+Registrations are read the way the metaclasses read them: from the class's **own** body, since both
+key on `"game" in dct`. An inherited `game` never registers anything — core's factorio, kh1 and kh2
+all name `.zip` on classes that inherit it, and none of them clash. `.zip` is skipped outright, as
+core raises on it before it reaches the registry.
 
 Two *pages* can also land on the same file — a rename the wiki still lists under both names, or a
 page whose own release is not in the repository, so the name match settles for the only asset there.
@@ -284,6 +356,7 @@ verdict per game:
 | `failed-to-load` | the world is in `failed_world_loads`; it never registered |
 | `invalid-for-webhost` | it fails `hasattr(world.web, "tutorials")`, so the WebHost drops it |
 | `template-failed` | `Options.generate_yaml_templates` raises on it |
+| `docs-missing` | it has tutorials but no `docs/` folder, so the tutorial copy raises |
 
 That last one is why this exists. The WebHost calls it through `create_options_files()` **before it
 serves anything**, and it raises on the first world it cannot render — so one bad world does not get
@@ -367,7 +440,7 @@ exactly once:
   "removed": "worlds/some_game",
   "first_rejected": "2026-08-16T23:10:33Z",
   "checked": {
-    "checks_version": 3,
+    "checks_version": 4,
     "archipelago_version": "0.6.8",
     "container_version": 7,
     "webhost_check": "error"

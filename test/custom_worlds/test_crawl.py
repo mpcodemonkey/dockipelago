@@ -36,6 +36,15 @@ from tools.custom_worlds.wiki import WikiClient
 
 VERSIONS = CoreVersions(ap_version=(0, 6, 8), container_version=7)
 
+#: A world with nothing wrong with it, as the baseline every rejection fixture is derived from.
+GOOD_WORLD = (
+    "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
+    "class MyGameWeb(WebWorld):\n"
+    '    setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n'
+    "    tutorials = [setup]\n"
+    'class MyGameWorld(World):\n    game = "Some Game Game"\n    web = MyGameWeb()\n'
+)
+
 
 class CrawlTestCase(unittest.TestCase):
     """Builds a throwaway Archipelago checkout and a wiki/GitHub pair that serve one game."""
@@ -76,6 +85,7 @@ class CrawlTestCase(unittest.TestCase):
         manifest: dict[str, Any] | None = None,
         download_href: str | None = None,
         init_source: str = "# test world\n",
+        extra_files: dict[str, str] | None = None,
     ) -> Path:
         href = download_href if download_href is not None else f"https://github.com/{repo}"
         self.pages[title] = {
@@ -90,6 +100,7 @@ class CrawlTestCase(unittest.TestCase):
             module=module if module is not None else Path(asset_name).stem,
             manifest=default_manifest(f"{title} Game") if manifest is None else manifest,
             init_source=init_source,
+            extra_files=extra_files,
         )
 
     def add_page(self, title: str, *, repo: str) -> None:
@@ -425,6 +436,66 @@ class TestFailures(CrawlTestCase):
         self.assertEqual(OUTCOME_SKIPPED, self.record_for(records, "Votipelago").outcome)
         self.assertEqual([entry["title"] for entry in self.lock["worlds"]], ["Wargroove 2"])
 
+    def test_a_world_with_tutorials_but_no_docs_folder_is_refused(self) -> None:
+        # WebHost.py os.listdir()s each world's docs/ at start-up, so a missing one is fatal to the
+        # whole site rather than to the one game.
+        self.add_game("Duck Life 4", asset_name="ducklife4.apworld", init_source=GOOD_WORLD)
+        make_apworld(
+            self.assets / "ducklife4.apworld",
+            module="ducklife4",
+            manifest=default_manifest("Duck Life 4 Game"),
+            init_source=GOOD_WORLD,
+            docs=False,
+        )
+        record = self.record_for(self.crawl(), "Duck Life 4")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("ships no 'docs/' folder", record.reason)
+        self.assert_not_installed("ducklife4")
+
+    def test_a_world_claiming_a_core_patch_extension_is_skipped(self) -> None:
+        """What took out core's own Gauntlet Legends: a custom world claiming '.apgl'.
+
+        AutoPatchRegister keys extensions globally, so the second class to claim one raises and its
+        world fails to import - and worlds/ loads alphabetically, so the loser can be core's.
+        """
+        (self.root / "worlds" / "gl").mkdir(parents=True)
+        (self.root / "worlds" / "gl" / "__init__.py").write_text(
+            'from worlds.AutoWorld import World\nclass GLWorld(World):\n    game = "Gauntlet Legends"\n',
+            encoding="utf-8",
+        )
+        (self.root / "worlds" / "gl" / "Rom.py").write_text(
+            'class GLPatch:\n    game = "Gauntlet Legends"\n    patch_file_ending = ".apgl"\n',
+            encoding="utf-8",
+        )
+        self.add_game(
+            "Gauntlet Legends AP",
+            asset_name="gauntlet_legends.apworld",
+            manifest=default_manifest("Gauntlet Legends Custom"),
+            init_source="from .Rom import GLPatch\n" + GOOD_WORLD.replace("My Game", "Gauntlet Legends Custom"),
+            extra_files={
+                "gauntlet_legends/Rom.py":
+                    'class GLPatch:\n    game = "Gauntlet Legends Custom"\n    patch_file_ending = ".apgl"\n',
+            },
+        )
+        records = self.crawl()
+
+        record = self.record_for(records, "Gauntlet Legends AP")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("'.apgl' is already registered by worlds/gl", record.reason)
+        self.assert_not_installed("gauntlet_legends")
+
+    def test_a_world_claiming_a_core_game_name_is_skipped(self) -> None:
+        (self.root / "worlds" / "gl").mkdir(parents=True)
+        (self.root / "worlds" / "gl" / "__init__.py").write_text(
+            'from worlds.AutoWorld import World\nclass GLWorld(World):\n    game = "Gauntlet Legends"\n',
+            encoding="utf-8",
+        )
+        self.add_game("Gauntlet Legends", asset_name="glap.apworld",
+                      manifest=default_manifest("Gauntlet Legends"))
+        record = self.record_for(self.crawl(), "Gauntlet Legends")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("already provided by worlds/gl", record.reason)
+
     def test_a_wiki_page_that_fails_to_load_is_reported(self) -> None:
         self.pages["Broken Page"] = {}
         self.http.routes.insert(0, ("Broken+Page", self._raise_page_error))
@@ -694,13 +765,7 @@ class TestSharedRepository(CrawlTestCase):
 class TestWebWorldRejection(CrawlTestCase):
     """Worlds Archipelago cannot load, or the WebHost will not serve, never reach worlds/."""
 
-    GOOD = (
-        "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
-        "class MyGameWeb(WebWorld):\n"
-        '    setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n'
-        "    tutorials = [setup]\n"
-        'class MyGameWorld(World):\n    game = "Some Game Game"\n    web = MyGameWeb()\n'
-    )
+    GOOD = GOOD_WORLD
     NOT_INSTANTIATED = GOOD.replace("web = MyGameWeb()", "web = MyGameWeb")
     NO_TUTORIALS = GOOD.replace(
         '    setup = Tutorial(tutorial_name="Setup Guide", file_name="setup.md")\n    tutorials = [setup]\n',
@@ -1242,6 +1307,21 @@ class TestArchiveMode(CrawlTestCase):
     """The same pipeline, but leaving the .apworld file intact instead of unpacking it."""
 
     install_mode = INSTALL_ARCHIVE
+
+    def test_a_missing_docs_folder_does_not_matter_here(self) -> None:
+        # The zip branch of copy_tutorials_files_to_static() copies whatever is under docs/ and is
+        # content to find nothing, so this is only a problem for worlds installed as folders.
+        self.add_game("Duck Life 4", asset_name="ducklife4.apworld", init_source=GOOD_WORLD)
+        make_apworld(
+            self.assets / "ducklife4.apworld",
+            module="ducklife4",
+            manifest=default_manifest("Duck Life 4 Game"),
+            init_source=GOOD_WORLD,
+            docs=False,
+        )
+        record = self.record_for(self.crawl(), "Duck Life 4")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome)
+        self.assert_installed("ducklife4")
 
     def test_installs_the_apworld_file_itself(self) -> None:
         source = self.add_game("Some Game")

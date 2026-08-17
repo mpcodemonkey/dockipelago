@@ -13,11 +13,12 @@ import json
 import logging
 import re
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from .webworld import inspect_world, module_path
+from .webworld import SEVERITY_NOTE, inspect_world, module_path, patch_endings
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,8 @@ class VerificationResult:
     manifest: Manifest | None = None
     #: Machine-readable codes for the problems found, so a run can be diffed against a later one.
     codes: list[str] = field(default_factory=list)
+    #: Patch file extensions this world registers globally, which two worlds cannot share.
+    patch_endings: set[str] = field(default_factory=set)
 
     @property
     def module_name(self) -> str:
@@ -153,7 +156,7 @@ def parse_version(value: str) -> tuple[int, ...] | None:
 
 
 def verify_apworld(
-    path: Path, versions: CoreVersions, *, webhost_check: str = WEBHOST_ERROR
+    path: Path, versions: CoreVersions, *, webhost_check: str = WEBHOST_ERROR, check_docs: bool = True
 ) -> VerificationResult:
     """Check that ``path`` is an apworld this Archipelago checkout can load.
 
@@ -161,6 +164,9 @@ def verify_apworld(
     for having no ``web.tutorials``. Such a world still generates, so ``"warn"`` installs it anyway
     and ``"off"`` ignores the question entirely; the default rejects it, because a world the WebHost
     will not serve is dead weight in an image built to serve exactly that.
+
+    ``check_docs`` asks whether a missing ``docs/`` folder matters, which depends on how the world
+    will be installed: as a folder it stops the WebHost starting, as an ``.apworld`` it does not.
     """
     result = VerificationResult(path=path)
 
@@ -178,7 +184,7 @@ def verify_apworld(
                 result.fail(STATUS_INVALID, f"corrupt entry in archive: {corrupt}")
                 return result
             _check_layout(archive, path, result)
-            _check_webworld(archive, path, result, webhost_check=webhost_check)
+            _check_webworld(archive, path, result, webhost_check=webhost_check, check_docs=check_docs)
             manifest_data = _read_manifest(archive, result)
     except zipfile.BadZipFile as error:
         result.fail(STATUS_INVALID, f"not a valid zip archive: {error}")
@@ -222,6 +228,7 @@ def _check_webworld(
     result: VerificationResult,
     *,
     webhost_check: str,
+    check_docs: bool = True,
 ) -> None:
     """Read the world's Python modules and report broken WebWorld wiring.
 
@@ -239,8 +246,21 @@ def _check_webworld(
         result.fail(STATUS_INVALID, f"could not read the modules of {path.name}: {error}")
         return
 
-    for finding in inspect_world(modules, module_name=path.stem):
-        if finding.blocks_loading or webhost_check == WEBHOST_ERROR:
+    # Only a world installed as a folder needs its own docs/: the zip branch of
+    # copy_tutorials_files_to_static() walks the archive and copies whatever is under docs/, so an
+    # .apworld without any just contributes nothing instead of raising.
+    files = (
+        [name[len(prefix):] for name in archive.namelist() if name.startswith(prefix)]
+        if check_docs
+        else None
+    )
+    result.patch_endings = patch_endings(modules)
+    for finding in inspect_world(modules, module_name=path.stem, files=files):
+        if finding.severity == SEVERITY_NOTE:
+            # The world serves; something about it is degraded. Never a reason to refuse it.
+            result.codes.append(finding.code)
+            result.warn(finding.detail)
+        elif finding.blocks_loading or webhost_check == WEBHOST_ERROR:
             result.codes.append(finding.code)
             result.fail(STATUS_INVALID, finding.detail)
         elif webhost_check == WEBHOST_WARN:
@@ -361,11 +381,23 @@ def _version_string(version: tuple[int, ...]) -> str:
     return ".".join(str(part) for part in version)
 
 
-def find_conflicts(results: list[VerificationResult], existing_worlds: set[str]) -> dict[Path, list[str]]:
+def find_conflicts(
+    results: list[VerificationResult],
+    existing_worlds: set[str],
+    *,
+    existing_games: Mapping[str, str] | None = None,
+    existing_endings: Mapping[str, str] | None = None,
+) -> dict[Path, list[str]]:
     """Report clashes that only show up once several worlds are installed side by side.
 
-    Core keys worlds by module name and by game name, and silently drops the loser in either case,
+    Core keys worlds by module name and by game name, and drops or refuses the loser in either case,
     so these are worth catching before a Docker image is built around them.
+
+    ``existing_games`` and ``existing_endings`` map a core world's game name and patch extensions to
+    the module that already claims them. Both are global registries, and neither cares that one side
+    ships with Archipelago: a custom world claiming a taken patch extension makes whichever loads
+    second fail to import, and alphabetical order decides which - so a custom world really can knock
+    out one of core's own.
     """
     conflicts: dict[Path, list[str]] = {}
 
@@ -374,10 +406,13 @@ def find_conflicts(results: list[VerificationResult], existing_worlds: set[str])
 
     by_module: dict[str, list[VerificationResult]] = {}
     by_game: dict[str, list[VerificationResult]] = {}
+    by_ending: dict[str, list[VerificationResult]] = {}
     for result in results:
         by_module.setdefault(result.module_name, []).append(result)
         if result.game:
             by_game.setdefault(result.game, []).append(result)
+        for ending in result.patch_endings:
+            by_ending.setdefault(ending, []).append(result)
 
     for module_name, group in by_module.items():
         if module_name in existing_worlds:
@@ -389,9 +424,36 @@ def find_conflicts(results: list[VerificationResult], existing_worlds: set[str])
                 add(result.path, f"module name '{module_name}' is claimed by more than one file: {others}")
 
     for game, group in by_game.items():
+        owner = (existing_games or {}).get(game)
+        if owner is not None:
+            for result in group:
+                add(
+                    result.path,
+                    f"game '{game}' is already provided by worlds/{owner}, which ships with "
+                    "Archipelago; core raises RuntimeError on the second world to register a game",
+                )
         if len(group) > 1:
             others = ", ".join(sorted(str(other.path.name) for other in group))
             for result in group:
                 add(result.path, f"game '{game}' is provided by more than one file: {others}; core loads only one")
+
+    for ending, group in by_ending.items():
+        owner = (existing_endings or {}).get(ending)
+        if owner is not None:
+            for result in group:
+                add(
+                    result.path,
+                    f"patch extension '{ending}' is already registered by worlds/{owner}, which "
+                    "ships with Archipelago; whichever of the two loads second raises "
+                    "ImproperlyConfiguredAutoPatchError and fails to import",
+                )
+        if len(group) > 1:
+            others = ", ".join(sorted(str(other.path.name) for other in group))
+            for result in group:
+                add(
+                    result.path,
+                    f"patch extension '{ending}' is claimed by more than one file: {others}; "
+                    "the second to load fails with ImproperlyConfiguredAutoPatchError",
+                )
 
     return conflicts

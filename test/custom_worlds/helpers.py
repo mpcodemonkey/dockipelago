@@ -58,13 +58,22 @@ def make_apworld(
     manifest_at_root: bool = False,
     init_source: str = "# test world\n",
     extra_files: Mapping[str, str] | None = None,
+    docs: bool = True,
 ) -> Path:
-    """Write a syntactically valid ``.apworld`` at ``path`` and return it."""
+    """Write a syntactically valid ``.apworld`` at ``path`` and return it.
+
+    ``docs`` ships the ``docs/`` folder a published world carries, because the WebHost lists that
+    folder at start-up for any world with tutorials. It defaults on so a fixture looks like a real
+    world; the tests for the missing-folder case turn it off.
+    """
     module = module if module is not None else path.stem
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         if module:
             archive.writestr(f"{module}/__init__.py", init_source)
+            supplied = any(name.startswith(f"{module}/docs/") for name in (extra_files or {}))
+            if docs and not supplied:
+                archive.writestr(f"{module}/docs/setup_en.md", "# Setup\n")
         if manifest is not None:
             location = "archipelago.json" if manifest_at_root else f"{module}/archipelago.json"
             archive.writestr(location, json.dumps(manifest))
