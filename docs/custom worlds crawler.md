@@ -310,10 +310,12 @@ As a standing check, the test suite runs the analysis over every world bundled w
 1771 modules across 82 worlds — and requires zero findings. 81 of those worlds reach the `tutorials`
 check rather than being skipped, so the guarantee is about precision, not silence.
 
-Two more checks only make sense once several worlds are installed together, and skip both sides when
+Some checks only make sense once several worlds are installed together, and skip both sides when
 they fire:
 
-- a world whose module name would shadow one that already ships with Archipelago;
+- a world whose module name would shadow one that already ships with Archipelago — compared under
+  the name it will be installed as, so the [`cw_` prefix](#the-cw_-prefix) is what makes this
+  effectively unreachable rather than something to rely on;
 - two worlds claiming the same module name or the same `game`, where core silently loads only one;
 - a world claiming a `game` that a core world already registers — `AutoWorldRegister` raises
   `RuntimeError` on the second world to claim a name;
@@ -397,16 +399,67 @@ deliberate about, which is why it is opt-in.
 Static checks stay worth having: they need no dependencies, execute nothing, and catch most of this
 in seconds during the crawl. `--validate` is the backstop for what they cannot see.
 
+## The `cw_` prefix
+
+Every custom world is installed under its own name behind `cw_`, so `mygame.apworld` becomes
+`worlds/cw_mygame/`. `worlds/` is a single Python package, so a folder name is a global: a custom
+world called `alttp` would shadow the one that ships with Archipelago. The prefix gives the crawler's
+worlds a namespace of their own where that cannot happen.
+
+It is worth being clear about what this does **not** fix. Core does not key worlds on their folder
+name — it registers them by `game`, and patch containers by extension — so a prefix does nothing
+about a duplicate `game` or a duplicate `patch_file_ending`. Those are the collisions that actually
+bite, including the one that took out core's Gauntlet Legends, and they are caught by the
+[cross-world checks](#the-whole-world-is-read-not-just-__init__py) instead.
+
+### Renaming a package means fixing the source that assumed it
+
+Most worlds reach their own modules with relative imports, which do not care what the package is
+called. A minority spell it out — 11 of the 82 worlds bundled with Archipelago do somewhere:
+
+```python
+from worlds.dark_souls_3.Bosses import all_bosses
+```
+
+Every one of those lines is a `ModuleNotFoundError` once the folder moves, so they are rewritten as
+the world is installed:
+
+```python
+from worlds.cw_dark_souls_3.Bosses import all_bosses
+```
+
+Only real import statements are rewritten, located with `ast` rather than by matching text, so a
+docstring that happens to mention `worlds.something` is left alone. The rename map covers every world
+in the run, not just the one being written, because custom worlds occasionally import each other —
+and core's names are never in the map, so a world reaching into `worlds.alttp` still gets core's.
+
+What cannot be rewritten is a module path built as a **string** — `"worlds.mygame.data"` handed to
+`importlib`, or a resource path like `"ap:worlds/mygame/assets/icon.png"`. Rewriting every string
+that matched would corrupt prose that merely mentions the world, so these are reported as warnings
+against the world instead. Around 8% of core's worlds contain one, so expect a handful; most are
+usage messages rather than anything that resolves at runtime, but they are worth a glance.
+
+### Choosing a different prefix
+
+`--module-prefix` changes it, and `--module-prefix ""` turns it off and installs each world under its
+own name as before. A prefix that cannot start a Python identifier is refused: `cw-` looks reasonable
+and `worlds/cw-mygame` even imports through `importlib`, but `from worlds.cw-mygame.Items import x`
+is a `SyntaxError`, so the very imports above could not be rewritten to match.
+
+The prefix is part of each lockfile entry's fingerprint, so changing it re-installs every world
+rather than leaving two copies behind — and the copy at the old path is removed as the new one is
+written, since a leftover unprefixed folder would still occupy the name the prefix exists to vacate.
+
 ## Install modes
 
-By default each apworld is **extracted**: `mygame.apworld` becomes `worlds/mygame/`. Core loads that
-as an ordinary folder world, and git can diff it, review it, and store it without a binary blob per
-release.
+By default each apworld is **extracted**: `mygame.apworld` becomes `worlds/cw_mygame/`. Core loads
+that as an ordinary folder world, and git can diff it, review it, and store it without a binary blob
+per release.
 
-`--install-mode archive` drops the `.apworld` file into `worlds/` unchanged instead. Core loads those
-too, via `zipimport`. Note that the file name is never rewritten in this mode, including its case:
-core imports the world as `worlds.<file stem>` and then looks for a folder of exactly that name
-inside the zip, so lower-casing the file would break it.
+`--install-mode archive` writes an `.apworld` file into `worlds/` instead, which core loads via
+`zipimport`. The file cannot simply be copied once the module name changes: core imports the world as
+`worlds.<file stem>` and then looks for a folder of exactly that name inside the zip, so the archive
+is repacked with its inner folder renamed to match. Case is still never altered, for the same reason.
 
 Archive members are validated during extraction rather than trusted — these zips come from third
 parties, and one that names a path outside its own folder is rejected rather than unpacked.
@@ -440,7 +493,7 @@ exactly once:
   "removed": "worlds/some_game",
   "first_rejected": "2026-08-16T23:10:33Z",
   "checked": {
-    "checks_version": 4,
+    "checks_version": 5,
     "archipelago_version": "0.6.8",
     "container_version": 7,
     "webhost_check": "error"
@@ -482,6 +535,7 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 | `--only "Page Title" …` | process specific pages instead of the whole category |
 | `--limit N` | stop after N pages, handy while iterating |
 | `--output custom_worlds` | install somewhere other than `worlds/` |
+| `--module-prefix cw_` | prefix custom worlds' module names so they cannot shadow a core world (`""` to disable) |
 | `--allow-prerelease` | accept pre-release GitHub releases |
 | `--ignore-game-mismatch` | install even when the manifest names a different game than the page |
 | `--webhost-check {error,warn,off}` | what to do about worlds the WebHost would drop (default `error`) |

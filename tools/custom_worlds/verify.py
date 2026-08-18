@@ -387,11 +387,15 @@ def find_conflicts(
     *,
     existing_games: Mapping[str, str] | None = None,
     existing_endings: Mapping[str, str] | None = None,
+    prefix: str = "",
 ) -> dict[Path, list[str]]:
     """Report clashes that only show up once several worlds are installed side by side.
 
     Core keys worlds by module name and by game name, and drops or refuses the loser in either case,
     so these are worth catching before a Docker image is built around them.
+
+    ``prefix`` is the module prefix the worlds will be installed under, since the name that has to
+    be free is the one they end up with rather than the one they were packaged as.
 
     ``existing_games`` and ``existing_endings`` map a core world's game name and patch extensions to
     the module that already claims them. Both are global registries, and neither cares that one side
@@ -415,9 +419,12 @@ def find_conflicts(
             by_ending.setdefault(ending, []).append(result)
 
     for module_name, group in by_module.items():
-        if module_name in existing_worlds:
+        # Compared under the name the world will actually be installed as: a prefix is what keeps a
+        # custom world out of core's namespace, so it is the prefixed name that has to be free.
+        installed_as = f"{prefix}{module_name}" if prefix else module_name
+        if installed_as in existing_worlds:
             for result in group:
-                add(result.path, f"'{module_name}' already exists in worlds/ and would shadow this file")
+                add(result.path, f"'{installed_as}' already exists in worlds/ and would shadow this file")
         if len(group) > 1:
             others = ", ".join(sorted(str(other.path.name) for other in group))
             for result in group:
