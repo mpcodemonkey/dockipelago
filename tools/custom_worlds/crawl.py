@@ -39,6 +39,7 @@ from .verify import (
     CoreVersions,
     VerificationResult,
     detect_core_versions,
+    detect_target_python,
     find_conflicts,
     verify_apworld,
 )
@@ -79,7 +80,7 @@ _FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED, OUTCOME_KNOWN_BA
 #: Bumped whenever the checks change their mind about what is acceptable. Lockfile entries written
 #: by an older version are re-verified rather than trusted, so a new check reaches worlds that were
 #: installed before it existed.
-CHECKS_VERSION = 5
+CHECKS_VERSION = 6
 
 
 @dataclass
@@ -139,6 +140,8 @@ class CrawlOptions:
     ignore_game_mismatch: bool = False
     validate: bool = False
     validate_python: str = sys.executable
+    #: Python the image will run. Older than this, a SyntaxError is not proof of a broken world.
+    target_python: tuple[int, int] | None = None
     webhost_check: str = WEBHOST_ERROR
     max_asset_bytes: int = DEFAULT_MAX_ASSET_BYTES
 
@@ -167,6 +170,16 @@ class Crawler:
         self.github = github
         self.versions = versions
         self.records: list[GameRecord] = []
+        target = options.target_python
+        #: Whether this interpreter can be trusted to judge a world's syntax. A world may use syntax
+        #: newer than the Python running the crawler, and refusing it would cost a working world.
+        self.syntax_authoritative = target is None or sys.version_info[:2] >= target
+        if not self.syntax_authoritative and target is not None:
+            logger.warning(
+                "Running Python %d.%d but the image runs %d.%d; worlds using newer syntax will be "
+                "reported rather than refused. Run the crawler on Python %d.%d for a firm answer.",
+                *sys.version_info[:2], *target, *target,
+            )
         previous, rejected = _read_lockfile(options.lockfile)
         self.previous = previous
         #: What earlier runs rejected, so the same broken release is not fetched again.
@@ -318,6 +331,7 @@ class Crawler:
             webhost_check=self.options.webhost_check,
             # A missing docs/ folder only stops the WebHost when the world is a folder it lists.
             check_docs=self.options.install_mode == INSTALL_EXTRACT,
+            syntax_authoritative=self.syntax_authoritative,
         )
         record.verification = result.status
         record.errors.extend(result.errors)
@@ -1146,6 +1160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_asset_bytes=args.max_asset_bytes,
     )
 
+    options.target_python = detect_target_python(root)
     versions = detect_core_versions(root)
     logger.info(
         "Archipelago %s (APContainer version %d) at %s",

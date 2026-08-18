@@ -18,6 +18,7 @@ from tools.custom_worlds.verify import (
     CoreVersions,
     VerificationResult,
     detect_core_versions,
+    detect_target_python,
     find_conflicts,
     parse_version,
     verify_apworld,
@@ -318,6 +319,38 @@ class TestFindConflicts(unittest.TestCase):
     def test_worlds_without_a_game_name_do_not_collide(self) -> None:
         results = [self._result("a.apworld", None), self._result("b.apworld", None)]
         self.assertEqual({}, find_conflicts(results, existing_worlds=set()))
+
+
+class TestTargetPython(unittest.TestCase):
+    """The image's Python decides whether a SyntaxError here means anything."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+
+    def write(self, text: str) -> None:
+        (self.root / "Dockerfile").write_text(text, encoding="utf-8")
+
+    def test_the_version_is_read_off_the_dockerfile(self) -> None:
+        self.write("FROM python:3.12-slim-bookworm AS archipelago\nRUN echo hi\n")
+        self.assertEqual((3, 12), detect_target_python(self.root))
+
+    def test_the_first_stage_wins(self) -> None:
+        self.write("FROM python:3.12 AS builder\nFROM python:3.13-slim AS run\n")
+        self.assertEqual((3, 12), detect_target_python(self.root))
+
+    def test_no_dockerfile_means_no_opinion(self) -> None:
+        self.assertIsNone(detect_target_python(self.root))
+
+    def test_an_unrecognised_base_image_means_no_opinion(self) -> None:
+        self.write("FROM debian:bookworm\n")
+        self.assertIsNone(detect_target_python(self.root))
+
+    def test_this_checkout_targets_the_python_its_dockerfile_names(self) -> None:
+        # The real Dockerfile, so the crawler and the image cannot silently drift apart.
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual((3, 12), detect_target_python(root))
 
 
 if __name__ == "__main__":

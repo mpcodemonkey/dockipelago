@@ -8,8 +8,9 @@ loading a world with the mistake in it:
     ``web = MyGameWeb`` assigns the class instead of an instance, and
     ``AutoWorldRegister.__new__`` asserts ``isinstance(dct["web"], WebWorld)``, so importing raises
     ``AssertionError: WebWorld has to be instantiated.``. Instantiating a name that does not exist
-    raises ``NameError``. Source that does not parse raises ``SyntaxError``, which is worse than it
-    sounds: it aborts ``import worlds`` outright rather than being caught per-world.
+    raises ``NameError``. Source that does not parse raises ``SyntaxError``. All three are caught
+    per-world by ``WorldSource.load`` and recorded in ``failed_world_loads``, so the world is simply
+    absent rather than taking anything else down with it.
 
 ``webhost`` - the world loads, but the WebHost drops it
     ``WebHost.py`` filters its world list down with ``hasattr(world.web, "tutorials")`` and logs
@@ -69,6 +70,8 @@ DOCS_MISSING = "docs-missing"
 SETTINGS_UNRESOLVABLE = "settings-unresolvable"
 #: A string literal contains an escape Python does not recognise, such as ``"setup\\en"``.
 BAD_ESCAPE = "bad-escape"
+#: An option sets ``visibility`` to a plain int rather than to a ``Visibility`` flag.
+VISIBILITY_NOT_A_FLAG = "visibility-not-a-flag"
 
 ROOT = ""  # the world package itself, i.e. <name>/__init__.py
 
@@ -81,6 +84,8 @@ _HIDDEN = "hidden"
 _SETTINGS = "settings"
 _DOCS = "docs"
 _PATCH_ENDING = "patch_file_ending"
+_OPTIONS_DATACLASS = "options_dataclass"
+_VISIBILITY = "visibility"
 _MAX_DEPTH = 10
 
 _DROPPED_BY_WEBHOST = (
@@ -132,6 +137,7 @@ def inspect_world(
     *,
     module_name: str = "",
     files: Collection[str] | None = None,
+    syntax_authoritative: bool = True,
 ) -> list[WebWorldFinding]:
     """Report WebWorld problems provable from a world's source.
 
@@ -139,6 +145,11 @@ def inspect_world(
     ``files`` is every path inside the world folder, Python or not, which is what the ``docs/``
     check needs. It is optional: a caller that cannot enumerate the package has nothing to say
     about a missing folder, and silence beats a guess.
+
+    ``syntax_authoritative`` says whether this interpreter is new enough to judge the world's syntax.
+    Source is parsed by whatever Python is running the crawler, and a world may legitimately use
+    syntax that Python does not have: 3.12 accepts ``type Alias = int | str`` where 3.11 raises. Run
+    older than the image, an unparseable module is reported without being treated as proof.
     """
     label = module_name or "the world"
     package = _Package(modules)
@@ -149,11 +160,7 @@ def inspect_world(
     if root is None:
         error = package.errors[ROOT]
         return [
-            WebWorldFinding(
-                code=UNPARSEABLE,
-                detail=f"{label}/__init__.py is not valid Python: line {error.lineno}: {error.msg}",
-                severity=SEVERITY_LOAD,
-            )
+            _unparseable(f"{label}/__init__.py", error, syntax_authoritative, imported=False)
         ]
 
     findings: list[WebWorldFinding] = []
@@ -162,14 +169,7 @@ def inspect_world(
             # The world imports this module, so Python will parse it too - and raise where we did.
             error = package.errors[path]
             findings.append(
-                WebWorldFinding(
-                    code=UNPARSEABLE,
-                    detail=(
-                        f"{label}/{path.replace('.', '/')}.py is not valid Python: "
-                        f"line {error.lineno}: {error.msg}; the world imports it, so it cannot load"
-                    ),
-                    severity=SEVERITY_LOAD,
-                )
+                _unparseable(f"{label}/{_file_name(path)}", error, syntax_authoritative, imported=True)
             )
 
     findings.extend(_check_escapes(label, package))
@@ -186,6 +186,7 @@ def inspect_world(
         settings = _check_settings(path, name, node, package)
         if settings is not None:
             findings.append(settings)
+        findings.extend(_check_option_visibility(name, path, node, package))
     return findings
 
 
@@ -250,6 +251,32 @@ def world_game(modules: Mapping[str, str]) -> str:
         if isinstance(resolved, ast.Constant) and isinstance(resolved.value, str):
             return resolved.value
     return ""
+
+
+def _unparseable(
+    where: str, error: SyntaxError, authoritative: bool, *, imported: bool
+) -> WebWorldFinding:
+    """A module that would not parse, graded by whether this interpreter can be trusted to say so.
+
+    A world that really is broken here still loads harmlessly badly: ``WorldSource.load`` catches the
+    SyntaxError, records it in ``failed_world_loads`` and carries on, so the other worlds and the
+    site are unaffected. That makes reporting-without-refusing the safe side to err on when this
+    Python is older than the image's - losing a working world costs more than shipping a broken one.
+    """
+    detail = f"{where} is not valid Python: line {error.lineno}: {error.msg}"
+    if imported:
+        detail += "; the world imports it"
+    if authoritative:
+        return WebWorldFinding(code=UNPARSEABLE, detail=f"{detail}, so it cannot load", severity=SEVERITY_LOAD)
+    return WebWorldFinding(
+        code=UNPARSEABLE,
+        detail=(
+            f"{detail}. This Python is older than the one the image runs, so that may only mean the "
+            "world uses syntax it does not have yet - installed anyway rather than refused. Run the "
+            "crawler on the image's Python to get a firm answer"
+        ),
+        severity=SEVERITY_NOTE,
+    )
 
 
 def _has_docs(files: Collection[str] | None) -> bool | None:
@@ -364,6 +391,74 @@ def _check_settings(
         severity=SEVERITY_WEBHOST,
         world_class=name,
     )
+
+
+def _check_option_visibility(
+    world_name: str, path: str, node: ast.ClassDef, package: "_Package"
+) -> list[WebWorldFinding]:
+    """``visibility`` has to be a ``Visibility`` flag, not the integer that flag is made of.
+
+    ``Visibility`` is an ``IntFlag``, and ``get_option_groups`` asks ``visibility_level in
+    option.visibility``. Membership works on the flag type and not on a bare ``int``::
+
+        TypeError: argument of type 'int' is not iterable
+
+    That propagates through ``generate_yaml_templates`` and out of ``create_options_files()``, so
+    like a flat ``options_presets`` it stops the WebHost booting rather than dropping one game.
+
+    Only the options core actually iterates are checked - the ones annotated on the world's
+    ``options_dataclass`` - which is the same set ``get_option_groups`` walks. An option class the
+    world defines but never attaches is never asked for its visibility, so it is not a problem.
+    """
+    found = package.find_attribute(path, node, _OPTIONS_DATACLASS)
+    if found is None or found.value is None:
+        return []
+    dataclass = package.class_from(found.module, found.value)
+    if dataclass is None:
+        return []
+
+    findings = []
+    for option_name, option in _annotated_options(dataclass, package):
+        visibility = package.find_attribute(option.module, option.node, _VISIBILITY)
+        if visibility is None or visibility.value is None:
+            continue
+        value = package.value_of(visibility.module, visibility.value).value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, int):
+            continue
+        if isinstance(value.value, bool):
+            continue  # True/False is a different mistake, and not one that raises here
+        findings.append(
+            WebWorldFinding(
+                code=VISIBILITY_NOT_A_FLAG,
+                detail=(
+                    f"{option.name}, the option behind '{option_name}', sets visibility to "
+                    f"{value.value!r} rather than to a Visibility flag. Visibility is an IntFlag and "
+                    "the WebHost asks 'visibility_level in option.visibility', which raises "
+                    "TypeError on a plain int - so create_options_files() fails and the server does "
+                    "not start at all. It needs Visibility.none, Visibility.template, or the flags "
+                    "combined with '|'"
+                ),
+                severity=SEVERITY_WEBHOST,
+                world_class=world_name,
+            )
+        )
+    return findings
+
+
+def _annotated_options(dataclass: "_Class", package: "_Package") -> Iterator[tuple[str, "_Class"]]:
+    """The option classes an options dataclass declares, following bases inside this world."""
+    seen: set[str] = set()
+    for current in package.own_and_bases(dataclass):
+        for statement in current.node.body:
+            if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.target, ast.Name):
+                continue
+            name = statement.target.id
+            if name in seen:
+                continue
+            seen.add(name)
+            option = package.class_from(current.module, statement.annotation)
+            if option is not None:
+                yield name, option
 
 
 def _core_settings_name(annotation: str) -> str:
@@ -557,6 +652,26 @@ def _check_presets(world_name: str, webworld: "_Class", package: "_Package") -> 
             world_class=world_name,
         )
     return None
+
+
+def _registers_as_world(node: ast.ClassDef) -> bool:
+    """Whether ``AutoWorldRegister`` will treat this class as a world, by core's own rule.
+
+    Naming ``World`` as a base is the obvious case, but it is not the rule core uses and it misses
+    real worlds: Age Of Empires II writes ``class Age2World(CachedRuleBuilderWorld)``, whose base
+    lives in core and so cannot be resolved from inside the apworld. Nothing about that class was
+    ever checked, and it reached the image without a WebWorld.
+
+    The rule core actually applies is ``"game" in dct`` - the class's own body - and it then asserts
+    ``item_name_to_id`` and ``location_name_to_id`` are there too. A class carrying all three is one
+    Archipelago registers, whatever it inherits from. Requiring all three is also what keeps patch
+    containers out: they carry ``game`` as well, but never the id maps.
+    """
+    return all(_own_attribute(node, attribute) is not None for attribute in _WORLD_MARKERS)
+
+
+#: What core requires of a class in its own body before it registers as a world.
+_WORLD_MARKERS = ("game", "item_name_to_id", "location_name_to_id")
 
 
 def _is_lone_tutorial(node: ast.expr) -> bool:
@@ -758,13 +873,13 @@ class _Package:
                 yield origin
 
     def world_classes(self) -> Iterator[tuple[str, str, ast.ClassDef]]:
-        """Every ``World`` subclass in the modules this world reaches."""
+        """Every class in the modules this world reaches that Archipelago will register as a world."""
         for path in self.reachable():
             index = self.index(path)
             if index is None:
                 continue
             for name, node in index.classes.items():
-                if self.descends_from(path, node, _WORLD_BASE):
+                if self.descends_from(path, node, _WORLD_BASE) or _registers_as_world(node):
                     yield path, name, node
 
     # -- name resolution ---------------------------------------------------------------
@@ -991,6 +1106,15 @@ class _Package:
                     if found is not None:
                         return found
         return None
+
+    def own_and_bases(self, start: "_Class", depth: int = 0) -> Iterator["_Class"]:
+        """A class and the base classes of it this world defines, nearest first."""
+        yield start
+        if depth > _MAX_DEPTH:
+            return
+        for _name, resolved in self.bases(start.module, start.node):
+            if resolved is not None:
+                yield from self.own_and_bases(resolved, depth + 1)
 
     def string_annotations(self, module: str) -> bool:
         """Whether this module's annotations reach core as strings rather than objects."""

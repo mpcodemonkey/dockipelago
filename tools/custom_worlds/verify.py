@@ -30,6 +30,7 @@ FALLBACK_CONTAINER_VERSION = 7
 
 _VERSION_RE = re.compile(r"^__version__\s*=\s*[\"']([^\"']+)[\"']", re.MULTILINE)
 _CONTAINER_VERSION_RE = re.compile(r"^container_version\s*:\s*int\s*=\s*(\d+)", re.MULTILINE)
+_DOCKER_PYTHON_RE = re.compile(r"^FROM\s+python:(\d+)\.(\d+)", re.MULTILINE | re.IGNORECASE)
 
 STATUS_OK = "ok"
 STATUS_WARNING = "warning"
@@ -147,6 +148,21 @@ def detect_core_versions(root: Path) -> CoreVersions:
     return CoreVersions(ap_version, container_version)
 
 
+def detect_target_python(root: Path) -> tuple[int, int] | None:
+    """The Python the image will run, read off the Dockerfile, or None if it cannot be read.
+
+    This matters because a world's source is judged by whatever interpreter the crawler happens to
+    be running. Python 3.12 accepts ``type Alias = int | str``; 3.11 raises SyntaxError on it. Run
+    from 3.11, the checks would refuse a world that the 3.12 image loads perfectly well - which is
+    exactly how Age Of Empires II came to be rejected here.
+    """
+    dockerfile = root / "Dockerfile"
+    if not dockerfile.is_file():
+        return None
+    match = _DOCKER_PYTHON_RE.search(dockerfile.read_text(encoding="utf-8", errors="replace"))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
 def parse_version(value: str) -> tuple[int, ...] | None:
     """Parse a ``"major.minor.build"`` string the way ``Utils.tuplize_version`` does, or return None."""
     try:
@@ -156,7 +172,12 @@ def parse_version(value: str) -> tuple[int, ...] | None:
 
 
 def verify_apworld(
-    path: Path, versions: CoreVersions, *, webhost_check: str = WEBHOST_ERROR, check_docs: bool = True
+    path: Path,
+    versions: CoreVersions,
+    *,
+    webhost_check: str = WEBHOST_ERROR,
+    check_docs: bool = True,
+    syntax_authoritative: bool = True,
 ) -> VerificationResult:
     """Check that ``path`` is an apworld this Archipelago checkout can load.
 
@@ -167,6 +188,10 @@ def verify_apworld(
 
     ``check_docs`` asks whether a missing ``docs/`` folder matters, which depends on how the world
     will be installed: as a folder it stops the WebHost starting, as an ``.apworld`` it does not.
+
+    ``syntax_authoritative`` says whether this interpreter is new enough to judge the world's syntax.
+    Running older than the image, a SyntaxError may only mean the world uses syntax this Python does
+    not have yet, so it is reported without refusing the world.
     """
     result = VerificationResult(path=path)
 
@@ -184,7 +209,14 @@ def verify_apworld(
                 result.fail(STATUS_INVALID, f"corrupt entry in archive: {corrupt}")
                 return result
             _check_layout(archive, path, result)
-            _check_webworld(archive, path, result, webhost_check=webhost_check, check_docs=check_docs)
+            _check_webworld(
+                archive,
+                path,
+                result,
+                webhost_check=webhost_check,
+                check_docs=check_docs,
+                syntax_authoritative=syntax_authoritative,
+            )
             manifest_data = _read_manifest(archive, result)
     except zipfile.BadZipFile as error:
         result.fail(STATUS_INVALID, f"not a valid zip archive: {error}")
@@ -229,6 +261,7 @@ def _check_webworld(
     *,
     webhost_check: str,
     check_docs: bool = True,
+    syntax_authoritative: bool = True,
 ) -> None:
     """Read the world's Python modules and report broken WebWorld wiring.
 
@@ -255,7 +288,10 @@ def _check_webworld(
         else None
     )
     result.patch_endings = patch_endings(modules)
-    for finding in inspect_world(modules, module_name=path.stem, files=files):
+    findings = inspect_world(
+        modules, module_name=path.stem, files=files, syntax_authoritative=syntax_authoritative
+    )
+    for finding in findings:
         if finding.severity == SEVERITY_NOTE:
             # The world serves; something about it is degraded. Never a reason to refuse it.
             result.codes.append(finding.code)

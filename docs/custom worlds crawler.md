@@ -168,7 +168,7 @@ parsed, never imported — and fall into two groups.
 | --- | --- |
 | `web = MyGameWeb` — the class, not an instance | `AutoWorldRegister` asserts `isinstance(dct["web"], WebWorld)`, so importing raises `AssertionError: WebWorld has to be instantiated.` |
 | `web = MyGameWeb()` where `MyGameWeb` does not exist | `NameError` at import |
-| any module the world imports is not valid Python | `SyntaxError`, which aborts `import worlds` entirely rather than being caught per-world |
+| any module the world imports is not valid Python | `SyntaxError` at import — see [the Python version caveat](#the-crawlers-python-has-to-be-the-images) below |
 
 The first two are recognised in their module-qualified form as well — `web = web_world.MyGameWeb`
 and `web = web_world.MyGameWeb()` are exactly as common as the bare-name form, and the alias is
@@ -286,6 +286,32 @@ These are matched on the warning's message rather than its category, since the s
 `DeprecationWarning` before Python 3.12 and a `SyntaxWarning` from 3.12 on — and the crawler need
 not be running the interpreter the image will.
 
+### An option's `visibility` has to be a flag
+
+```python
+visibility = Visibility.template | Visibility.spoiler   # correct
+visibility = 0b0011                                     # rejected
+```
+
+`Visibility` is an `IntFlag`, and the WebHost asks `visibility_level in option.visibility`.
+Membership works on the flag and not on a bare `int`, so the equivalent integer raises
+`TypeError: argument of type 'int' is not iterable`, `create_options_files()` propagates it, and the
+site does not start. Only the options core itself walks are checked — the ones annotated on the
+world's `options_dataclass` — so an option class the world defines but never attaches is left alone.
+
+### The crawler's Python has to be the image's
+
+Worlds are parsed by whatever interpreter runs the crawler, and a world may legitimately use syntax
+that interpreter does not have. Python 3.12 accepts `type Alias = int | str`; 3.11 raises
+`SyntaxError` on it. Run from 3.11, the checks would refuse a world the 3.12 image loads perfectly
+well — which is exactly how Age Of Empires II came to be rejected here.
+
+So the image's Python is read off the `Dockerfile`, and when the crawler is running an older one, an
+unparseable module is reported without refusing the world, and the run says so up front. That is the
+safe side to err on: a world that really is broken this way is caught per-world by
+`WorldSource.load`, recorded in `failed_world_loads`, and costs nothing but itself — while a world
+wrongly refused is simply gone. Run the crawler on the image's Python for a firm answer.
+
 ### The whole world is read, not just `__init__.py`
 
 Splitting `World` and `WebWorld` across modules is normal — `from .web import MyGameWeb` — and a
@@ -303,6 +329,14 @@ world cannot load and it is rejected; if nothing imports it, it is dead code and
 leading UTF-8 byte-order mark is stripped before parsing, since several published worlds carry one
 and it would otherwise make every module look unreadable — and an unreadable package has nothing to
 complain about, which is the quietest way for a broken world to pass.
+
+A class counts as a world by the rule core uses, which is not "names `World` as a base". Core
+registers on `"game" in dct` and then asserts `item_name_to_id` and `location_name_to_id` are there
+too, so a class carrying all three in its own body is a world whatever it inherits from. That
+matters: Age Of Empires II writes `class Age2World(CachedRuleBuilderWorld)`, whose base lives in core
+and cannot be resolved from inside the apworld — under a base-name rule nothing about that class was
+read at all. Requiring all three markers is also what keeps patch containers out, since they carry
+`game` but never the id maps.
 
 **Only provable problems are reported.** Names imported from outside the world, base classes in
 another package, `tutorials` built by a function call, an instance built at module level, and
@@ -444,7 +478,7 @@ exactly once:
   "removed": "worlds/some_game",
   "first_rejected": "2026-08-16T23:10:33Z",
   "checked": {
-    "checks_version": 5,
+    "checks_version": 6,
     "archipelago_version": "0.6.8",
     "container_version": 7,
     "webhost_check": "error"

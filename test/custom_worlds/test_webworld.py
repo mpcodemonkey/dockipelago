@@ -21,6 +21,7 @@ from tools.custom_worlds.webworld import (
     SEVERITY_WEBHOST,
     TUTORIALS_NOT_A_LIST,
     UNPARSEABLE,
+    VISIBILITY_NOT_A_FLAG,
     WEB_MISSING,
     WEB_NO_TUTORIALS,
     WEB_NOT_INSTANTIATED,
@@ -631,6 +632,146 @@ class TestWorldGame(unittest.TestCase):
     def test_a_game_built_at_runtime_is_not_guessed_at(self) -> None:
         source = world("web = MyGameWeb()", header=WORLD_HEADER).replace('game = "My Game"', "game = make_name()")
         self.assertEqual("", world_game({ROOT: source}))
+
+
+class TestOptionVisibility(WebWorldTestCase):
+    """Visibility is an IntFlag, and "level in option.visibility" raises on a plain int."""
+
+    HEADER = (
+        "from worlds.AutoWorld import World, WebWorld, Tutorial\n"
+        "from Options import Toggle, Visibility, PerGameCommonOptions\n"
+        "from dataclasses import dataclass\n"
+    )
+
+    def build(self, visibility: str, *, extra: str = "", attached: str = "my_option: MyOption") -> list[str]:
+        source = (
+            self.HEADER
+            + f"class MyGameWeb(WebWorld):\n{TUTORIALS}"
+            + f"class MyOption(Toggle):\n    visibility = {visibility}\n"
+            + extra
+            + f"@dataclass\nclass MyOptions(PerGameCommonOptions):\n    {attached}\n"
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+            + "    options_dataclass = MyOptions\n"
+        )
+        return self.codes(source)
+
+    def test_a_bare_int_is_reported(self) -> None:
+        codes = self.build("0b0011")
+        self.assertEqual([VISIBILITY_NOT_A_FLAG], codes)
+
+    def test_zero_is_reported_too(self) -> None:
+        # Visibility.none exists precisely so nobody has to write 0 here.
+        self.assertEqual([VISIBILITY_NOT_A_FLAG], self.build("0"))
+
+    def test_the_severity_stops_the_server_not_the_world(self) -> None:
+        source = (
+            self.HEADER
+            + f"class MyGameWeb(WebWorld):\n{TUTORIALS}"
+            + "class MyOption(Toggle):\n    visibility = 3\n"
+            + "@dataclass\nclass MyOptions(PerGameCommonOptions):\n    my_option: MyOption\n"
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+            + "    options_dataclass = MyOptions\n"
+        )
+        finding = inspect_source(source, module_name="mygame")[0]
+        self.assertEqual(SEVERITY_WEBHOST, finding.severity)
+        self.assertIn("create_options_files()", finding.detail)
+
+    def test_the_flag_forms_core_uses_are_all_accepted(self) -> None:
+        for form in (
+            "Visibility.none",
+            "Visibility.template",
+            "Visibility.template | Visibility.spoiler",
+            "Visibility.template | Visibility.complex_ui | Visibility.spoiler",
+            "Visibility.all & ~Visibility.simple_ui",
+            "Visibility.all ^ Visibility.simple_ui",
+        ):
+            with self.subTest(form=form):
+                self.assertEqual([], self.build(form))
+
+    def test_a_visibility_computed_at_runtime_is_left_alone(self) -> None:
+        self.assertEqual([], self.build("choose_visibility()"))
+
+    def test_an_option_the_dataclass_never_attaches_is_left_alone(self) -> None:
+        # get_option_groups only walks the options on the dataclass, so an unused class is not a bug.
+        codes = self.build(
+            "Visibility.none",
+            extra="class Unused(Toggle):\n    visibility = 3\n",
+        )
+        self.assertEqual([], codes)
+
+    def test_an_option_inherited_by_the_dataclass_is_still_checked(self) -> None:
+        source = (
+            self.HEADER
+            + f"class MyGameWeb(WebWorld):\n{TUTORIALS}"
+            + "class MyOption(Toggle):\n    visibility = 3\n"
+            + "@dataclass\nclass BaseOptions(PerGameCommonOptions):\n    my_option: MyOption\n"
+            + "@dataclass\nclass MyOptions(BaseOptions):\n    pass\n"
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+            + "    options_dataclass = MyOptions\n"
+        )
+        self.assertEqual([VISIBILITY_NOT_A_FLAG], self.codes(source))
+
+    def test_a_world_with_no_options_dataclass_is_left_alone(self) -> None:
+        source = (
+            self.HEADER
+            + f"class MyGameWeb(WebWorld):\n{TUTORIALS}"
+            + 'class MyGameWorld(World):\n    game = "My Game"\n    web = MyGameWeb()\n'
+        )
+        self.assertEqual([], self.codes(source))
+
+
+class TestWorldsCoreWouldRegister(WebWorldTestCase):
+    """Naming World as a base is not the rule core uses, and worlds that do not are still worlds."""
+
+    HEADER = (
+        "from worlds.AutoWorld import WebWorld\nfrom BaseClasses import Tutorial\n"
+        "from worlds.generic.rules import CachedRuleBuilderWorld\n"
+    )
+    MARKERS = '    game = "G"\n    item_name_to_id = {}\n    location_name_to_id = {}\n'
+    GOOD_WEB = 'class GWeb(WebWorld):\n    tutorials = [Tutorial("S", "d", "en", "s.md", "s/en", ["m"])]\n'
+
+    def build(self, web_class: str, web_line: str) -> list[str]:
+        source = self.HEADER + web_class + f"class GWorld(CachedRuleBuilderWorld):\n{self.MARKERS}{web_line}"
+        return [f.code for f in inspect_world({ROOT: source}, module_name="w", files=["__init__.py", "docs/x.md"])]
+
+    def test_a_world_on_a_core_base_is_still_checked(self) -> None:
+        # Age Of Empires II writes "class Age2World(CachedRuleBuilderWorld)". The base is core's, so
+        # it cannot be resolved from inside the apworld, and nothing about the class used to be read.
+        codes = self.build('class GWeb(WebWorld):\n    theme = "grass"\n', "    web = GWeb()\n")
+        self.assertEqual([WEB_NO_TUTORIALS], codes)
+
+    def test_an_uninstantiated_web_on_a_core_base_is_caught(self) -> None:
+        self.assertEqual([WEB_NOT_INSTANTIATED], self.build(self.GOOD_WEB, "    web = GWeb\n"))
+
+    def test_a_correct_world_on_a_core_base_is_clean(self) -> None:
+        self.assertEqual([], self.build(self.GOOD_WEB, "    web = GWeb()\n"))
+
+    def test_a_patch_container_is_not_mistaken_for_a_world(self) -> None:
+        # It carries "game" too, but never the id maps core asserts on, so it is not registered.
+        source = self.HEADER + 'class P:\n    game = "G"\n    patch_file_ending = ".apx"\n'
+        findings = inspect_world({ROOT: source}, module_name="w", files=["__init__.py"])
+        self.assertEqual([], [f.code for f in findings])
+
+    def test_the_id_maps_are_required_before_a_class_counts(self) -> None:
+        source = self.HEADER + 'class Half:\n    game = "G"\n    item_name_to_id = {}\n'
+        self.assertEqual([], [f.code for f in inspect_world({ROOT: source}, module_name="w", files=["__init__.py"])])
+
+
+class TestSyntaxAuthority(WebWorldTestCase):
+    """A SyntaxError only proves a world is broken if this Python is as new as the image's."""
+
+    BROKEN = "type Alias = int | str\n"  # valid on 3.12, a SyntaxError before it
+
+    def test_an_authoritative_interpreter_refuses_the_world(self) -> None:
+        findings = inspect_world({ROOT: self.BROKEN}, module_name="w", syntax_authoritative=True)
+        self.assertEqual([UNPARSEABLE], [f.code for f in findings])
+        self.assertEqual(SEVERITY_LOAD, findings[0].severity)
+
+    def test_an_older_interpreter_reports_without_refusing(self) -> None:
+        findings = inspect_world({ROOT: self.BROKEN}, module_name="w", syntax_authoritative=False)
+        self.assertEqual([UNPARSEABLE], [f.code for f in findings])
+        self.assertEqual(SEVERITY_NOTE, findings[0].severity)
+        self.assertIn("older than the one the image runs", findings[0].detail)
 
 
 class TestAgainstTheBundledWorlds(unittest.TestCase):
