@@ -3,7 +3,6 @@
 import json
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -26,7 +25,6 @@ from tools.custom_worlds.crawl import (
     write_lockfile,
 )
 from tools.custom_worlds.releases import GitHubClient
-from tools.custom_worlds.rename import DEFAULT_MODULE_PREFIX, prefixed
 from tools.custom_worlds.validate import (
     INVALID_FOR_WEBHOST,
     TEMPLATE_FAILED,
@@ -52,7 +50,6 @@ class CrawlTestCase(unittest.TestCase):
     """Builds a throwaway Archipelago checkout and a wiki/GitHub pair that serve one game."""
 
     install_mode = INSTALL_EXTRACT
-    module_prefix = DEFAULT_MODULE_PREFIX
 
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
@@ -149,7 +146,6 @@ class CrawlTestCase(unittest.TestCase):
             "output_dir": self.root / "worlds",
             "lockfile": self.root / "custom_worlds.lock.json",
             "install_mode": self.install_mode,
-            "module_prefix": self.module_prefix,
         }
         settings.update(overrides)
         return CrawlOptions(**settings)
@@ -184,11 +180,10 @@ class CrawlTestCase(unittest.TestCase):
         return next(record for record in records if record.title == title)
 
     def world_path(self, stem: str, *, output: str = "worlds") -> Path:
-        """Where a world with this module name ends up, under the install mode and module prefix."""
-        name = prefixed(stem, self.module_prefix)
+        """Where a world with this module name ends up under the current install mode."""
         if self.install_mode == INSTALL_ARCHIVE:
-            return self.root / output / f"{name}.apworld"
-        return self.root / output / name
+            return self.root / output / f"{stem}.apworld"
+        return self.root / output / stem
 
     def assert_installed(self, stem: str, *, output: str = "worlds") -> None:
         path = self.world_path(stem, output=output)
@@ -259,8 +254,8 @@ class TestHappyPath(CrawlTestCase):
         self.crawl()
         with zipfile.ZipFile(source) as archive:
             expected = archive.read("mygame/__init__.py")
-        self.assertEqual(expected, (self.world_path("mygame") / "__init__.py").read_bytes())
-        self.assertTrue((self.world_path("mygame") / "archipelago.json").is_file())
+        self.assertEqual(expected, (self.root / "worlds" / "mygame" / "__init__.py").read_bytes())
+        self.assertTrue((self.root / "worlds" / "mygame" / "archipelago.json").is_file())
 
     def test_extraction_leaves_no_temporary_directory_behind(self) -> None:
         self.add_game("Some Game")
@@ -389,8 +384,7 @@ class TestFailures(CrawlTestCase):
         self.assertEqual(1, len(self.lock["worlds"]))
 
     def test_a_world_that_would_shadow_a_bundled_one_is_skipped(self) -> None:
-        # The name that has to be free is the one the world is installed under, prefix included.
-        bundled = self.world_path("mygame")
+        bundled = self.root / "worlds" / "mygame"
         bundled.mkdir()
         (bundled / "__init__.py").write_text("", encoding="utf-8")
         self.add_game("Some Game")
@@ -399,54 +393,6 @@ class TestFailures(CrawlTestCase):
         self.assertEqual(OUTCOME_SKIPPED, record.outcome)
         self.assertIn("already exists in worlds/", record.reason)
         self.assertFalse((bundled / "archipelago.json").exists())
-
-    def test_absolute_self_imports_are_repointed_at_the_new_name(self) -> None:
-        """A world that spells its own package out has to keep working once the folder moves.
-
-        11 of the 82 worlds bundled with Archipelago write imports this way, so it is normal source
-        rather than an oddity, and every such line is a ModuleNotFoundError after a rename.
-        """
-        self.add_game(
-            "Some Game",
-            init_source="from worlds.mygame.Rules import RULE\n" + GOOD_WORLD,
-            extra_files={
-                "mygame/Rules.py": "from worlds.mygame.Items import X\nRULE = X\n",
-                "mygame/Items.py": 'X = "x"\n',
-            },
-        )
-        self.crawl()
-
-        installed = self.world_path("mygame")
-        self.assertEqual(
-            "from worlds.cw_mygame.Rules import RULE",
-            (installed / "__init__.py").read_text(encoding="utf-8").splitlines()[0],
-        )
-        self.assertEqual(
-            "from worlds.cw_mygame.Items import X",
-            (installed / "Rules.py").read_text(encoding="utf-8").splitlines()[0],
-        )
-
-    def test_a_module_path_written_as_a_string_is_flagged(self) -> None:
-        # Rewriting text would corrupt prose that matches, so these are reported instead.
-        self.add_game("Some Game", init_source='DATA = "worlds/mygame/data"\n' + GOOD_WORLD)
-        record = self.record_for(self.crawl(), "Some Game")
-        self.assertEqual(OUTCOME_INSTALLED, record.outcome)
-        self.assertTrue(
-            any("names a module path as a string" in warning for warning in record.warnings),
-            record.warnings,
-        )
-
-    def test_the_prefix_keeps_a_world_out_of_a_bundled_name(self) -> None:
-        # A custom world named like a core one is exactly what the prefix is for: unprefixed this
-        # shadows core's mygame, prefixed it lands beside it and both load.
-        bundled = self.root / "worlds" / "mygame"
-        bundled.mkdir()
-        (bundled / "__init__.py").write_text("", encoding="utf-8")
-        self.add_game("Some Game")
-        record = self.record_for(self.crawl(), "Some Game")
-        self.assertEqual(OUTCOME_INSTALLED, record.outcome)
-        self.assertEqual("worlds/cw_mygame", record.file)
-        self.assertTrue((bundled / "__init__.py").is_file(), "core's own world is untouched")
 
     def test_two_pages_shipping_the_same_game_are_both_skipped(self) -> None:
         self.add_game("Game A", repo="a/a", asset_name="a.apworld", manifest=default_manifest("Shared Game"))
@@ -549,33 +495,6 @@ class TestFailures(CrawlTestCase):
         record = self.record_for(self.crawl(), "Gauntlet Legends")
         self.assertEqual(OUTCOME_SKIPPED, record.outcome)
         self.assertIn("already provided by worlds/gl", record.reason)
-
-    def test_changing_the_prefix_moves_the_world_and_removes_the_old_copy(self) -> None:
-        """The migration every existing install goes through the first time a prefix is set.
-
-        Leaving the old folder behind would be worse than not renaming at all: both copies load, and
-        the unprefixed one still occupies the name the prefix exists to vacate.
-        """
-        self.add_game("Some Game")
-        self.crawl(self.options(module_prefix=""))
-        self.assertTrue((self.root / "worlds" / "mygame" / "__init__.py").is_file())
-
-        records = self.crawl(self.options(module_prefix="cw_"))
-        record = self.record_for(records, "Some Game")
-        self.assertEqual("worlds/cw_mygame", record.file)
-        self.assertEqual("worlds/mygame", record.removed)
-        self.assertTrue((self.root / "worlds" / "cw_mygame" / "__init__.py").is_file())
-        self.assertFalse((self.root / "worlds" / "mygame").exists(), "the old copy must not linger")
-        self.assertEqual(["worlds/cw_mygame"], [entry["file"] for entry in self.lock["worlds"]])
-
-    def test_the_prefix_is_fingerprinted_so_a_rerun_does_not_reuse_the_old_path(self) -> None:
-        self.add_game("Some Game")
-        self.crawl(self.options(module_prefix=""))
-        # Same prefix again is genuinely unchanged; a different one has to re-install.
-        again = self.record_for(self.crawl(self.options(module_prefix="")), "Some Game")
-        self.assertEqual(OUTCOME_UNCHANGED, again.outcome)
-        moved = self.record_for(self.crawl(self.options(module_prefix="cw_")), "Some Game")
-        self.assertIn(moved.outcome, (OUTCOME_INSTALLED, OUTCOME_UPDATED))
 
     def test_a_wiki_page_that_fails_to_load_is_reported(self) -> None:
         self.pages["Broken Page"] = {}
@@ -1303,8 +1222,7 @@ class TestValidation(CrawlTestCase):
             verdicts=[
                 WorldVerdict(
                     game="Bad Game Game",
-                    # validate.py reads this off the installed folder, so it carries the prefix.
-                    module=prefixed("bad", DEFAULT_MODULE_PREFIX),
+                    module="bad",
                     status=TEMPLATE_FAILED,
                     reason="AttributeError: 'list' object has no attribute 'update'",
                 ),
@@ -1405,32 +1323,22 @@ class TestArchiveMode(CrawlTestCase):
         self.assertEqual(OUTCOME_INSTALLED, record.outcome)
         self.assert_installed("ducklife4")
 
-    def test_installs_the_apworld_repacked_under_the_prefixed_name(self) -> None:
-        # Core imports worlds.<file stem> and then wants a folder of exactly that name inside the
-        # zip, so renaming the file means renaming the folder inside it too.
+    def test_installs_the_apworld_file_itself(self) -> None:
         source = self.add_game("Some Game")
         records = self.crawl()
         self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Some Game").outcome)
-        installed = self.world_path("mygame")
-        with zipfile.ZipFile(installed) as archive:
-            names = archive.namelist()
-            self.assertIn("cw_mygame/__init__.py", names)
-            self.assertFalse([name for name in names if name.startswith("mygame/")])
-            with zipfile.ZipFile(source) as original:
-                self.assertEqual(
-                    sorted(name.split("/", 1)[1] for name in original.namelist()),
-                    sorted(name.split("/", 1)[1] for name in names),
-                )
+        installed = self.root / "worlds" / "mygame.apworld"
+        self.assertEqual(source.read_bytes(), installed.read_bytes())
 
     def test_nothing_is_unpacked(self) -> None:
         self.add_game("Some Game")
         self.crawl()
-        self.assertFalse((self.root / "worlds" / prefixed("mygame", self.module_prefix)).exists())
+        self.assertFalse((self.root / "worlds" / "mygame").exists())
 
     def test_a_tampered_file_is_re_downloaded(self) -> None:
         self.add_game("Some Game")
         self.crawl()
-        self.world_path("mygame").write_bytes(b"corrupted")
+        (self.root / "worlds" / "mygame.apworld").write_bytes(b"corrupted")
         records = self.crawl()
         self.assertEqual(OUTCOME_UPDATED, self.record_for(records, "Some Game").outcome)
 
@@ -1446,7 +1354,7 @@ class TestArchiveMode(CrawlTestCase):
         self.add_game("Some Game", asset_name="MyGame.apworld", module="MyGame")
         records = self.crawl()
         self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Some Game").outcome)
-        self.assertTrue((self.root / "worlds" / "cw_MyGame.apworld").is_file())
+        self.assertTrue((self.root / "worlds" / "MyGame.apworld").is_file())
 
 
 class TestExtractWorld(unittest.TestCase):

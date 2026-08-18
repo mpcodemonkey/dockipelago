@@ -28,13 +28,6 @@ from typing import Any
 from .http import HttpClient, HttpError
 from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
-from .rename import (
-    DEFAULT_MODULE_PREFIX,
-    prefixed,
-    rewrite_imports,
-    string_references,
-    valid_prefix,
-)
 from .validate import validate_installed_worlds
 from .verify import (
     MAX_MODULE_BYTES,
@@ -86,7 +79,7 @@ _FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED, OUTCOME_KNOWN_BA
 #: Bumped whenever the checks change their mind about what is acceptable. Lockfile entries written
 #: by an older version are re-verified rather than trusted, so a new check reaches worlds that were
 #: installed before it existed.
-CHECKS_VERSION = 5
+CHECKS_VERSION = 4
 
 
 @dataclass
@@ -109,8 +102,6 @@ class GameRecord:
     asset_name: str = ""
     file: str = ""
     sha256: str = ""
-    #: Hash of the file as installed, which differs from the asset's once the zip is repacked.
-    installed_sha256: str = ""
     size: int = 0
     game: str = ""
     world_version: str = ""
@@ -145,7 +136,6 @@ class CrawlOptions:
     dry_run: bool = False
     prune: bool = False
     install_mode: str = INSTALL_EXTRACT
-    module_prefix: str = DEFAULT_MODULE_PREFIX
     ignore_game_mismatch: bool = False
     validate: bool = False
     validate_python: str = sys.executable
@@ -431,18 +421,14 @@ class Crawler:
         if self.options.install_mode == INSTALL_ARCHIVE:
             if not installed.is_file():
                 return False
-            # Cheap tamper check: an edited or truncated file gets re-downloaded. Compared against
-            # the hash of what was written rather than of what was downloaded, since archive mode
-            # repacks the zip to rename the folder inside it and the two differ.
-            expected = previous.get("installed_sha256") or previous.get("sha256")
-            if hashlib.sha256(installed.read_bytes()).hexdigest() != expected:
+            # Cheap tamper check: an edited or truncated file gets re-downloaded.
+            if hashlib.sha256(installed.read_bytes()).hexdigest() != previous.get("sha256"):
                 return False
         elif not (installed.is_dir() and (installed / "__init__.py").is_file()):
             return False
 
         record.file = str(previous["file"])
         record.sha256 = str(previous.get("sha256") or "")
-        record.installed_sha256 = str(previous.get("installed_sha256") or "")
         record.size = int(previous.get("size") or 0)
         record.game = str(previous.get("game") or "")
         record.world_version = str(previous.get("world_version") or "")
@@ -519,7 +505,6 @@ class Crawler:
             and checked.get("archipelago_version") == self.versions.ap_version_string
             and checked.get("container_version") == self.versions.container_version
             and checked.get("webhost_check") == self.options.webhost_check
-            and checked.get("module_prefix", "") == self.options.module_prefix
         )
 
     def _remembered_rejection(self, record: GameRecord) -> dict[str, Any] | None:
@@ -615,7 +600,6 @@ class Crawler:
             self._existing_world_names(),
             existing_games=games,
             existing_endings=endings,
-            prefix=self.options.module_prefix,
         )
         for path, messages in conflicts.items():
             record = verified[path][0]
@@ -679,81 +663,22 @@ class Crawler:
     def _install(self, verified: dict[Path, tuple[GameRecord, VerificationResult]]) -> None:
         output = self.options.output_dir
         output.mkdir(parents=True, exist_ok=True)
-        prefix = self.options.module_prefix
-        # Every world in the run at once, because custom worlds sometimes import each other and a
-        # world reaching for a sibling has to find it under its new name too. Core's own names are
-        # never in here, so "from worlds.alttp import ..." still means core's alttp.
-        renames = {
-            path.stem: prefixed(path.stem, prefix) for path in verified if prefixed(path.stem, prefix) != path.stem
-        }
-
         installed: set[Path] = set()
         for path, (record, _result) in verified.items():
-            module_name = prefixed(path.stem, prefix)
             if self.options.install_mode == INSTALL_ARCHIVE:
-                destination = output / f"{module_name}.apworld"
+                destination = output / path.name
                 existed = destination.exists()
-                repack_world(path, destination, module_name, renames)
-                record.installed_sha256 = hashlib.sha256(destination.read_bytes()).hexdigest()
+                shutil.copy2(path, destination)
             else:
-                destination = output / module_name
+                destination = output / path.stem
                 existed = destination.exists()
-                extract_world(path, destination, renames)
+                extract_world(path, destination)
             installed.add(destination)
             record.file = str(_relative(destination, self.options.root))
             record.outcome = OUTCOME_UPDATED if existed else OUTCOME_INSTALLED
-            self._warn_about_string_paths(path, record, renames)
-            self._remove_superseded(record, destination)
 
         if self.options.prune:
             self._prune(output, installed)
-
-    def _warn_about_string_paths(self, staged: Path, record: GameRecord, renames: dict[str, str]) -> None:
-        """Point out module paths written as strings, which the rename cannot follow.
-
-        Imports are rewritten; a path assembled as text is not, because the same match inside a
-        docstring would be corrupted by rewriting it. These keep working only if nothing resolves
-        them, so they are worth naming rather than leaving to be found at generation time.
-        """
-        if not renames:
-            return
-        try:
-            with zipfile.ZipFile(staged) as archive:
-                found: list[str] = []
-                for info in archive.infolist():
-                    if info.is_dir() or not info.filename.endswith(".py"):
-                        continue
-                    if info.file_size > MAX_MODULE_BYTES:
-                        continue
-                    source = archive.read(info).decode("utf-8", errors="replace")
-                    found.extend(string_references(source, renames))
-        except (OSError, zipfile.BadZipFile):
-            return
-        for reference in sorted(set(found))[:5]:
-            message = f"names a module path as a string ({reference!r}), which the rename cannot follow"
-            record.warnings.append(message)
-            logger.info("  note: %s %s", record.title, message)
-
-    def _remove_superseded(self, record: GameRecord, destination: Path) -> None:
-        """Delete what an earlier run installed for this page under a name we no longer use.
-
-        Changing the module prefix moves every world, and the copy at the old path would otherwise
-        sit in worlds/ forever - loading alongside the new one, under its old unprefixed name, which
-        is the collision this prefix exists to avoid. Only the exact path the lockfile recorded is
-        touched, and only when it is not where this run just wrote.
-        """
-        previous = self.previous.get(_lock_key(record.title, record.asset_name))
-        if previous is None or not previous.get("file"):
-            return
-        stale = self.options.root / str(previous["file"])
-        if stale == destination or stale.parent != self.options.output_dir or not stale.exists():
-            return
-        if stale.is_dir():
-            shutil.rmtree(stale)
-        else:
-            stale.unlink()
-        record.removed = str(previous["file"])
-        logger.info("  removed %s, replaced by %s", record.removed, record.file)
 
     def _prune(self, output: Path, installed: set[Path]) -> None:
         """Delete worlds a previous run installed that this run no longer wants.
@@ -808,7 +733,6 @@ def write_lockfile(
         "archipelago_version": versions.ap_version_string,
         "container_version": versions.container_version,
         "webhost_check": options.webhost_check,
-        "module_prefix": options.module_prefix,
     }
     ordered = sorted(records, key=lambda item: item.title.lower())
     # A partial run (--only, --limit) must not erase everything it did not look at. A full one may:
@@ -826,7 +750,6 @@ def write_lockfile(
             "asset_name": record.asset_name,
             "download_url": record.download_url,
             "file": record.file,
-            "installed_sha256": record.installed_sha256,
             "shared_repo": record.shared_repo,
             "install_mode": options.install_mode,
             "sha256": record.sha256,
@@ -851,7 +774,6 @@ def write_lockfile(
         "checks_version": CHECKS_VERSION,
         "category": options.category,
         "install_mode": options.install_mode,
-        "module_prefix": options.module_prefix,
         "webhost_check": options.webhost_check,
         "output_dir": str(_relative(options.output_dir, options.root)),
         "worlds": worlds,
@@ -1001,12 +923,8 @@ def _read_world_folder(folder: Path) -> dict[str, str]:
     return modules
 
 
-def extract_world(archive: Path, destination: Path, renames: dict[str, str] | None = None) -> None:
+def extract_world(archive: Path, destination: Path) -> None:
     """Unpack the ``<stem>/`` folder out of an apworld into ``destination``.
-
-    The folder is named after ``destination``, not after the archive, so a world can be installed
-    under a different module name than the one it was packaged as. ``renames`` then repoints the
-    absolute imports that spelled the old name out; see :mod:`.rename`.
 
     Archive members are validated rather than trusted: a zip can name entries that escape the
     directory it is unpacked into, and these files come from third parties. Extraction happens in a
@@ -1034,12 +952,8 @@ def extract_world(archive: Path, destination: Path, renames: dict[str, str] | No
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                data = zip_file.read(info)
-                rewritten = _rewritten_module(info.filename, data, renames)
-                if rewritten is not None:
-                    target.write_bytes(rewritten)
-                else:
-                    target.write_bytes(data)
+                with zip_file.open(info) as source, target.open("wb") as sink:
+                    shutil.copyfileobj(source, sink)
 
         if destination.exists():
             shutil.rmtree(destination)
@@ -1047,59 +961,6 @@ def extract_world(archive: Path, destination: Path, renames: dict[str, str] | No
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-
-
-def repack_world(
-    archive: Path, destination: Path, module_name: str, renames: dict[str, str] | None = None
-) -> None:
-    """Copy an apworld into place, renaming the folder inside it to ``module_name``.
-
-    Archive mode cannot simply copy the file once the module name changes: core imports the world as
-    ``worlds.<file stem>`` and then looks for a folder of exactly that name inside the zip, so the
-    two have to be renamed together. Written to a temporary file first, then moved into place.
-    """
-    source_prefix = f"{archive.stem}/"
-    staging = destination.with_name(f".{destination.name}.packing")
-    if staging.exists():
-        staging.unlink()
-
-    try:
-        with zipfile.ZipFile(archive) as zip_file, zipfile.ZipFile(
-            staging, "w", zipfile.ZIP_DEFLATED
-        ) as out:
-            for info in zip_file.infolist():
-                if not info.filename.startswith(source_prefix):
-                    continue
-                relative = info.filename[len(source_prefix):]
-                if not relative:
-                    continue
-                if _safe_join(Path(staging.parent), relative) is None:
-                    raise ValueError(f"{archive.name} contains an unsafe archive path: {info.filename!r}")
-                if info.is_dir():
-                    continue
-                data = zip_file.read(info)
-                rewritten = _rewritten_module(info.filename, data, renames)
-                out.writestr(f"{module_name}/{relative}", rewritten if rewritten is not None else data)
-        staging.replace(destination)
-    finally:
-        if staging.exists():
-            staging.unlink()
-
-
-def _rewritten_module(name: str, data: bytes, renames: dict[str, str] | None) -> bytes | None:
-    """A Python module with its absolute self-imports repointed, or None to write it unchanged.
-
-    Anything that is not decodable Python source is left exactly as it was: this only ever rewrites
-    text it could parse, and a world's data files are none of its business.
-    """
-    if not renames or not name.endswith(".py"):
-        return None
-    try:
-        source = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    rewritten = rewrite_imports(source, renames)
-    return rewritten.encode("utf-8") if rewritten != source else None
 
 
 def _safe_join(base: Path, relative: str) -> Path | None:
@@ -1243,13 +1104,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="interpreter to run --validate with; it needs Archipelago's own requirements "
         "installed (default: the one running this script)",
     )
-    parser.add_argument(
-        "--module-prefix",
-        default=DEFAULT_MODULE_PREFIX,
-        help="install each custom world under this module-name prefix so it cannot shadow a world "
-        f"that ships with Archipelago (default: {DEFAULT_MODULE_PREFIX!r}; pass '' to install under "
-        "the world's own name)",
-    )
     parser.add_argument("--report", type=Path, help="write a detailed JSON report to this path")
     parser.add_argument("--github-token", default=None, help="GitHub token (defaults to $GITHUB_TOKEN / $GH_TOKEN)")
     parser.add_argument("--timeout", type=float, default=30.0, help="per-request timeout in seconds")
@@ -1285,18 +1139,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=args.dry_run,
         prune=args.prune,
         install_mode=args.install_mode,
-        module_prefix=args.module_prefix,
         ignore_game_mismatch=args.ignore_game_mismatch,
         validate=args.validate,
         validate_python=args.validate_python,
         webhost_check=args.webhost_check,
         max_asset_bytes=args.max_asset_bytes,
     )
-
-    problem = valid_prefix(options.module_prefix)
-    if problem:
-        logger.error("%s", problem)
-        return 2
 
     versions = detect_core_versions(root)
     logger.info(
