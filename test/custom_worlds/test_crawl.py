@@ -31,7 +31,7 @@ from tools.custom_worlds.validate import (
     ValidationReport,
     WorldVerdict,
 )
-from tools.custom_worlds.verify import CoreVersions
+from tools.custom_worlds.verify import CoreVersions, VerificationResult
 from tools.custom_worlds.wiki import WikiClient
 
 VERSIONS = CoreVersions(ap_version=(0, 6, 8), container_version=7)
@@ -974,6 +974,41 @@ class TestRemovingRejectedWorlds(CrawlTestCase):
         self.assertEqual(OUTCOME_SKIPPED, record.outcome)
         self.assertEqual(self.relative("mygame"), record.removed)
         self.assert_not_installed("mygame")
+
+    def test_a_world_installed_before_a_check_existed_is_removed_by_it(self) -> None:
+        """The case that matters after adding a check: worlds already in worlds/ from an older run.
+
+        DuckLife4 was installed before anything looked for a docs/ folder, so nothing about the new
+        check reaches it until its lockfile entry stops being trusted. That is what checks_version
+        is for - the entry no longer matches, the release is fetched and checked again, and this
+        time it is refused and the copy on disk goes with it.
+        """
+        self.add_game("Duck Life 4", asset_name="ducklife4.apworld", init_source=GOOD_WORLD)
+        make_apworld(
+            self.assets / "ducklife4.apworld",
+            module="ducklife4",
+            manifest=default_manifest("Duck Life 4 Game"),
+            init_source=GOOD_WORLD,
+            docs=False,
+        )
+        # Installed by a run whose checks knew nothing about docs/ folders.
+        with mock.patch("tools.custom_worlds.crawl.CHECKS_VERSION", 1):
+            with mock.patch("tools.custom_worlds.crawl.verify_apworld", self._without_docs_check):
+                self.crawl()
+        self.assert_installed("ducklife4")
+
+        record = self.record_for(self.crawl(), "Duck Life 4")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertIn("ships no 'docs/' folder", record.reason)
+        self.assertEqual(self.relative("ducklife4"), record.removed)
+        self.assert_not_installed("ducklife4")
+
+    @staticmethod
+    def _without_docs_check(path: Path, versions: CoreVersions, **kwargs: Any) -> VerificationResult:
+        """verify_apworld as it behaved before the docs/ check existed."""
+        from tools.custom_worlds.verify import verify_apworld as real
+
+        return real(path, versions, **{**kwargs, "check_docs": False})
 
     def test_the_removal_is_recorded_in_the_lockfile(self) -> None:
         self.install_then_break()

@@ -245,11 +245,6 @@ first group.
 Refusing them also means **taking back out** any copy an earlier run installed — see
 [Rejected worlds](#rejected-worlds) below.
 
-### Reported, but never a reason to refuse a world
-
-Two more are recorded as warnings. The world serves; something about it is degraded, and no policy
-setting turns either into a rejection.
-
 **A `settings` annotation core cannot read back.** `settings.py` does not evaluate the annotation.
 When it arrives as a string it takes the text, strips exactly one layer of brackets, and hands what
 is left to `getattr` on the world's module:
@@ -270,6 +265,15 @@ The annotation only reaches core as a string under `from __future__ import annot
 is written as a string literal. Without that it arrives as an object and `typing.get_args` resolves
 it, nesting and dotted names included — core's own sc2 writes `ClassVar[settings.Starcraft2Settings]`
 and is perfectly fine. So the string branch is a precondition for reporting this, not a detail.
+
+This costs more than the one world, which is why it is refused rather than noted: `Settings.dump`
+walks *every* registered world's settings to load them before writing `host.yaml`, so the
+`AttributeError` propagates out of that loop and the host's settings file is never written at all.
+
+### Reported, but never a reason to refuse a world
+
+One check is recorded as a warning only. The world serves, and no policy setting turns it into a
+rejection.
 
 **A backslash that is not an escape.** `"setup\en"` is meant to be `"setup/en"`. Python keeps the
 backslash and warns, so the world loads with a broken tutorial link and a warning on every start-up:
@@ -440,7 +444,7 @@ exactly once:
   "removed": "worlds/some_game",
   "first_rejected": "2026-08-16T23:10:33Z",
   "checked": {
-    "checks_version": 4,
+    "checks_version": 5,
     "archipelago_version": "0.6.8",
     "container_version": 7,
     "webhost_check": "error"

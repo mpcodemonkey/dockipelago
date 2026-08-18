@@ -331,6 +331,11 @@ def _check_settings(
     when the settings file is next written. Rather than guess at the shapes, this runs core's two
     lines and asks whether what falls out could be a name at all.
 
+    This costs more than the one world. ``Settings.dump`` walks *every* registered world's settings
+    to load them before writing ``host.yaml``, so the AttributeError propagates out of the loop and
+    the host's settings file is never written at all - the same shape of damage as a world that
+    breaks the option templates, which is why it is refused rather than merely noted.
+
     Without ``from __future__ import annotations`` the annotation arrives as a real object instead
     and core resolves it with ``typing.get_args``, which handles nesting and dotted names perfectly
     well - core's own sc2 writes ``ClassVar[settings.Starcraft2Settings]`` and is fine. Reporting
@@ -356,7 +361,7 @@ def _check_settings(
             "core strips one layer of brackets only, so it needs 'ClassVar[MySettings]' rather than "
             "'ClassVar[type[MySettings]]'"
         ),
-        severity=SEVERITY_NOTE,
+        severity=SEVERITY_WEBHOST,
         world_class=name,
     )
 
