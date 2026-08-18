@@ -223,6 +223,19 @@ This one depends on the install mode, and is only checked under `--install-mode 
 default). The zip branch of the same function walks the archive's entries and copies those under
 `docs/`, so an `.apworld` without any contributes nothing instead of raising.
 
+The same step then `copyfile`s every entry it listed, and a **subfolder is an entry**:
+
+```
+IsADirectoryError: [Errno 21] Is a directory: '/app/worlds/a1800/docs/images'
+```
+
+Rather than refuse a world over that, extraction leaves those files out and says which. It costs
+nothing that worked: the WebHost copies into one flat folder per game, so an image the markdown
+reaches as `images/diagram.png` was never going to be served from that path — core's own zip branch
+flattens such files to their base name for exactly this reason. Only `docs/` is treated this way; a
+world's own nested data folders are untouched. If stripping would leave `docs/` empty the folder is
+still created, since a missing one is the other way this same step dies.
+
 **The world loads, but the WebHost never finishes starting.** One shape is worse than being dropped:
 
 ```python
@@ -395,6 +408,7 @@ verdict per game:
 | `invalid-for-webhost` | it fails `hasattr(world.web, "tutorials")`, so the WebHost drops it |
 | `template-failed` | `Options.generate_yaml_templates` raises on it |
 | `docs-missing` | it has tutorials but no `docs/` folder, so the tutorial copy raises |
+| `docs-not-flat` | its `docs/` holds a subfolder, which the tutorial copy tries to `copyfile` |
 
 That last one is why this exists. The WebHost calls it through `create_options_files()` **before it
 serves anything**, and it raises on the first world it cannot render — so one bad world does not get
@@ -478,7 +492,7 @@ exactly once:
   "removed": "worlds/some_game",
   "first_rejected": "2026-08-16T23:10:33Z",
   "checked": {
-    "checks_version": 6,
+    "checks_version": 7,
     "archipelago_version": "0.6.8",
     "container_version": 7,
     "webhost_check": "error"

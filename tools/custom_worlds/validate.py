@@ -17,8 +17,9 @@ in a subprocess, and reports a verdict per game:
    before it serves anything, and it raises on the first world it cannot render. One bad world here
    does not get dropped; it stops the whole server from starting.
 4. ``copy_tutorials_files_to_static`` - the step after that, which lists every non-hidden world's
-   ``docs`` folder. A world installed as a folder without one raises FileNotFoundError, and again
-   the whole site fails to start rather than the one game.
+   ``docs`` folder and copies each entry. A world installed as a folder without one raises
+   FileNotFoundError; one whose ``docs`` holds a subfolder raises IsADirectoryError on it. Either
+   way the whole site fails to start rather than the one game.
 
 Step 3 is why this exists at all. It is run per world, with the registry temporarily narrowed to one
 game, so a single failure names the game responsible instead of aborting the sweep.
@@ -44,6 +45,7 @@ FAILED_TO_LOAD = "failed-to-load"
 INVALID_FOR_WEBHOST = "invalid-for-webhost"
 TEMPLATE_FAILED = "template-failed"
 DOCS_MISSING = "docs-missing"
+DOCS_NOT_FLAT = "docs-not-flat"
 
 #: How long to let the subprocess run. Importing several hundred worlds is not quick.
 DEFAULT_TIMEOUT = 900.0
@@ -155,6 +157,17 @@ for game, world in remaining.items():
             "module": module_of(world),
             "status": "docs-missing",
             "reason": "no docs/ folder, so copy_tutorials_files_to_static() raises at start-up",
+        })
+        continue
+    # The same step then copyfile()s every entry, and a subfolder is an entry.
+    nested = sorted(e for e in os.listdir(folder) if os.path.isdir(os.path.join(folder, e)))
+    if nested:
+        verdicts.append({
+            "game": game,
+            "module": module_of(world),
+            "status": "docs-not-flat",
+            "reason": "docs/ holds subfolder(s) %s, which copy_tutorials_files_to_static() tries to "
+                      "copyfile() and dies on" % ", ".join(nested[:3]),
         })
 
 emit({"registered": len(registry), "verdicts": verdicts})

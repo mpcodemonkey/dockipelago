@@ -60,6 +60,9 @@ DEFAULT_LOCKFILE = "custom_worlds.lock.json"
 DEFAULT_OUTPUT = "worlds"
 DEFAULT_MAX_ASSET_BYTES = 64 * 1024 * 1024
 
+#: The folder the WebHost copies each world's tutorial files out of.
+DOCS_FOLDER = "docs"
+
 #: How an apworld ends up in the output directory.
 #: ``extract`` unpacks ``<name>/`` out of the zip into ``worlds/<name>/`` - core loads that as a
 #: normal folder world, and git can diff it. ``archive`` drops the ``.apworld`` file in as-is.
@@ -80,7 +83,7 @@ _FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED, OUTCOME_KNOWN_BA
 #: Bumped whenever the checks change their mind about what is acceptable. Lockfile entries written
 #: by an older version are re-verified rather than trusted, so a new check reaches worlds that were
 #: installed before it existed.
-CHECKS_VERSION = 6
+CHECKS_VERSION = 7
 
 
 @dataclass
@@ -686,7 +689,12 @@ class Crawler:
             else:
                 destination = output / path.stem
                 existed = destination.exists()
-                extract_world(path, destination)
+                for left_out in extract_world(path, destination):
+                    record.warnings.append(
+                        f"left out {left_out}: the WebHost copies each world's docs/ into one flat "
+                        "folder and cannot handle a subfolder there"
+                    )
+                    logger.info("  %s: left out %s", record.title, left_out)
             installed.add(destination)
             record.file = str(_relative(destination, self.options.root))
             record.outcome = OUTCOME_UPDATED if existed else OUTCOME_INSTALLED
@@ -937,8 +945,11 @@ def _read_world_folder(folder: Path) -> dict[str, str]:
     return modules
 
 
-def extract_world(archive: Path, destination: Path) -> None:
+def extract_world(archive: Path, destination: Path) -> list[str]:
     """Unpack the ``<stem>/`` folder out of an apworld into ``destination``.
+
+    Returns the paths left out, which is only ever the contents of subfolders of ``docs/`` - see
+    :func:`_flattens_into_docs`.
 
     Archive members are validated rather than trusted: a zip can name entries that escape the
     directory it is unpacked into, and these files come from third parties. Extraction happens in a
@@ -950,6 +961,8 @@ def extract_world(archive: Path, destination: Path) -> None:
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
+    dropped: list[str] = []
+    has_docs = False
 
     try:
         with zipfile.ZipFile(archive) as zip_file:
@@ -958,6 +971,12 @@ def extract_world(archive: Path, destination: Path) -> None:
                     continue
                 relative = info.filename[len(prefix):]
                 if not relative:
+                    continue
+                if relative.rstrip("/") == DOCS_FOLDER or relative.startswith(f"{DOCS_FOLDER}/"):
+                    has_docs = True
+                if _nested_in_docs(relative):
+                    if not info.is_dir():
+                        dropped.append(relative)
                     continue
                 target = _safe_join(staging, relative)
                 if target is None:
@@ -969,12 +988,35 @@ def extract_world(archive: Path, destination: Path) -> None:
                 with zip_file.open(info) as source, target.open("wb") as sink:
                     shutil.copyfileobj(source, sink)
 
+        # A world whose docs/ held nothing but subfolders would otherwise end up with no docs/ at
+        # all, and a missing folder is the other way this same start-up step dies.
+        if has_docs:
+            (staging / DOCS_FOLDER).mkdir(parents=True, exist_ok=True)
+
         if destination.exists():
             shutil.rmtree(destination)
         staging.replace(destination)
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
+    return dropped
+
+
+def _nested_in_docs(relative: str) -> bool:
+    """Whether an archive member sits in a subfolder of ``docs/`` rather than directly in it.
+
+    ``copy_tutorials_files_to_static()`` lists a folder world's ``docs/`` and ``shutil.copyfile``s
+    every entry. A subfolder is an entry, and copying one raises::
+
+        IsADirectoryError: [Errno 21] Is a directory: '/app/worlds/a1800/docs/images'
+
+    which stops the WebHost starting, so these are left out rather than costing the whole site. It
+    costs nothing that worked: the WebHost copies into one flat folder per game, so an image the
+    markdown reaches as ``images/diagram.png`` was never going to be served from that path anyway -
+    core's own zip branch flattens such files to their base name for the same reason.
+    """
+    parts = relative.split("/")
+    return len(parts) > 2 and parts[0] == DOCS_FOLDER
 
 
 def _safe_join(base: Path, relative: str) -> Path | None:

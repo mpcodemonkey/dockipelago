@@ -1421,6 +1421,58 @@ class TestExtractWorld(unittest.TestCase):
         self.assertEqual("[]", (destination / "data" / "items.json").read_text(encoding="utf-8"))
         self.assertEqual("# setup", (destination / "docs" / "setup_en.md").read_text(encoding="utf-8"))
 
+    def test_a_subfolder_of_docs_is_left_out(self) -> None:
+        """What a1800 hit: the WebHost copyfile()s every entry of docs/, and a folder is an entry.
+
+        IsADirectoryError there stops the whole site, and the file was unreachable anyway - the
+        WebHost copies into one flat folder per game, so 'images/diagram.png' was never served from
+        that path.
+        """
+        archive = make_apworld(
+            self.tmp / "mygame.apworld",
+            manifest=default_manifest(),
+            extra_files={
+                "mygame/docs/setup_en.md": "# setup",
+                "mygame/docs/images/diagram.png": "png",
+                "mygame/docs/images/deep/more.png": "png",
+                "mygame/data/items.json": "[]",
+            },
+        )
+        destination = self.tmp / "mygame"
+        dropped = extract_world(archive, destination)
+
+        self.assertEqual(
+            ["docs/images/deep/more.png", "docs/images/diagram.png"], sorted(dropped)
+        )
+        self.assertEqual(["setup_en.md"], sorted(p.name for p in (destination / "docs").iterdir()))
+        # Only docs/ is flattened; a world's own data folders are none of this check's business.
+        self.assertTrue((destination / "data" / "items.json").is_file())
+
+    def test_docs_survives_even_when_only_subfolders_were_in_it(self) -> None:
+        # Removing the lot would leave no docs/ at all, which is the other way this step dies.
+        archive = make_apworld(
+            self.tmp / "mygame.apworld",
+            manifest=default_manifest(),
+            docs=False,
+            extra_files={"mygame/docs/images/diagram.png": "png"},
+        )
+        destination = self.tmp / "mygame"
+        extract_world(archive, destination)
+        self.assertTrue((destination / "docs").is_dir())
+        self.assertEqual([], list((destination / "docs").iterdir()))
+
+    def test_a_world_with_flat_docs_is_untouched(self) -> None:
+        archive = make_apworld(
+            self.tmp / "mygame.apworld",
+            manifest=default_manifest(),
+            extra_files={"mygame/docs/setup_en.md": "# setup", "mygame/docs/en_Game.md": "# game"},
+        )
+        destination = self.tmp / "mygame"
+        self.assertEqual([], extract_world(archive, destination))
+        self.assertEqual(
+            ["en_Game.md", "setup_en.md"], sorted(p.name for p in (destination / "docs").iterdir())
+        )
+
     def test_replacing_an_existing_world_removes_stale_files(self) -> None:
         destination = self.tmp / "mygame"
         destination.mkdir()
