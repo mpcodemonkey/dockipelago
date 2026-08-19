@@ -84,7 +84,7 @@ _FAILURE_OUTCOMES = frozenset({OUTCOME_FAILED, OUTCOME_SKIPPED, OUTCOME_KNOWN_BA
 #: Bumped whenever the checks change their mind about what is acceptable. Lockfile entries written
 #: by an older version are re-verified rather than trusted, so a new check reaches worlds that were
 #: installed before it existed.
-CHECKS_VERSION = 7
+CHECKS_VERSION = 8
 
 
 @dataclass

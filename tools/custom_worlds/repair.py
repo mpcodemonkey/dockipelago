@@ -36,7 +36,9 @@ from .webworld import (
     WEB_MISSING,
     WEB_NO_TUTORIALS,
     WebWorldFinding,
+    docs_folder,
     module_path,
+    world_modules,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,17 +134,54 @@ def plan_repair(
 
     plan.modules = {path: source for path, source in edited.items() if source != modules.get(path)}
 
+    # Last line of defence: whatever was written has to parse, and every name it leans on has to be
+    # bound at module level. Getting that wrong put "class CWWeb(WebWorld)" into worlds that never
+    # imported WebWorld, and the NameError only showed up when the image ran them. A repair that
+    # cannot pass this is dropped, leaving the world to be refused as it would have been.
+    for path, source in list(plan.modules.items()):
+        unusable = _unusable(source)
+        if unusable:
+            logger.warning("discarding repair of %s: %s", path or "__init__.py", unusable)
+            return RepairPlan()
+
     # A tutorial naming setup_en.md is only half an answer if the file is not there, so the docs are
     # written whenever anything was repaired - not only when docs/ was the finding.
-    wants_docs = plan.repaired or any(finding.code == DOCS_MISSING for finding in findings)
-    if wants_docs and f"{DOCS_FOLDER}/{SETUP_DOC}" not in files:
-        plan.files[f"{DOCS_FOLDER}/{SETUP_DOC}"] = b""
-        # Recorded whenever the file is written, not only when docs/ was the reported finding: a
-        # world repaired for its WebWorld never reached the docs check, and the lockfile should
-        # still say the guide came from here rather than from the world.
-        plan.repaired.append(DOCS_MISSING)
+    # Where the docs go follows the module that defines the World class, not the package root:
+    # WebHost lists dirname(world.__file__)/docs, so a world whose class lives in world/__init__.py
+    # is asked for world/docs and a guide at the root does nothing for it.
+    wants_docs = bool(plan.repaired) or any(finding.code == DOCS_MISSING for finding in findings)
+    if wants_docs:
+        # Asked of the World classes rather than of the findings: a tutorials repair happens in the
+        # WebWorld's module, which may not be where the World class - and so the docs folder - lives.
+        for module in world_modules(edited):
+            guide = f"{docs_folder(module, files)}/{SETUP_DOC}"
+            if guide in files or guide in plan.files:
+                continue
+            plan.files[guide] = b""
+            # Recorded whenever the file is written, not only when docs/ was the reported finding:
+            # a world repaired for its WebWorld never reached the docs check, and the lockfile
+            # should still say the guide came from here rather than from the world.
+            plan.repaired.append(DOCS_MISSING)
 
     return plan
+
+
+def _unusable(source: str) -> str:
+    """Why repaired source could not be trusted, or "" when it can be."""
+    try:
+        ast.parse(source)
+    except SyntaxError as error:
+        return f"the result does not parse: line {error.lineno}: {error.msg}"
+    for _module, name in _IMPORTS:
+        if _mentions(source, name) and not _binds(source, name):
+            return f"{name} is used but not bound at module level"
+    return ""
+
+
+def _mentions(source: str, name: str) -> bool:
+    """Whether the module refers to a name at all, so only names actually used are insisted on."""
+    tree = ast.parse(source)
+    return any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(tree))
 
 
 def repair_apworld(source: Path, destination: Path, findings: list[WebWorldFinding]) -> list[str]:
@@ -253,8 +292,10 @@ def _binds(source: str, name: str) -> bool:
         if isinstance(node, ast.ImportFrom):
             if any((alias.asname or alias.name) == name for alias in node.names):
                 return True
-            if any(alias.name == "*" for alias in node.names):
-                return True  # a star import may well be supplying it
+            # A star import is deliberately not treated as binding the name. It only *might* supply
+            # it, and guessing that it does is how powerwashsimulator and swr ended up with
+            # "class CWWeb(WebWorld)" above no import of WebWorld at all - a NameError at load. An
+            # import we did not need is harmless; one we skipped is not.
         elif isinstance(node, ast.Import):
             if any((alias.asname or alias.name.split(".")[0]) == name for alias in node.names):
                 return True

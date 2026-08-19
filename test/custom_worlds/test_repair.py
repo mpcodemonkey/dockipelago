@@ -243,6 +243,83 @@ class TestRepairLimits(RepairTestCase):
         self.assertTrue(verify_apworld(patched, VERSIONS).installable)
 
 
+class TestRegressions(RepairTestCase):
+    """Both of these reached a running image before they were caught."""
+
+    def test_a_star_import_does_not_hide_the_missing_webworld_import(self) -> None:
+        """powerwashsimulator and swr: 'class CWWeb(WebWorld)' above no import of WebWorld.
+
+        A star import only *might* supply a name. Treating it as though it did skipped the import
+        and left a NameError that only appeared when the image loaded the world.
+        """
+        init = (
+            "from worlds.AutoWorld import World\n"
+            "from .options import *\n"
+            "\n\n"
+            "class DemoWorld(World):\n" + WORLD_BODY.format(game="Demo")
+        )
+        source = self.build("demo", init, extra={"options.py": "OPT = 1\n"})
+        _applied, patched = self.repair(source)
+        repaired = self.contents(patched)["__init__.py"]
+
+        self.assertIn("from worlds.AutoWorld import WebWorld", repaired)
+        self.assertIn("from BaseClasses import Tutorial", repaired)
+        tree = ast.parse(repaired)
+        imported = next(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and any(a.name == "WebWorld" for a in node.names)
+        )
+        defined = next(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == GENERATED_WEB_CLASS
+        )
+        self.assertLess(imported, defined, "the import has to come before the class that uses it")
+        self.assertTrue(verify_apworld(patched, VERSIONS).installable)
+
+    def test_docs_go_beside_the_module_that_defines_the_world(self) -> None:
+        """factorio_platformer: the World class lives in a subpackage, so the docs do too.
+
+        AutoWorldRegister sets __file__ from the defining module and WebHost lists
+        dirname(__file__)/docs, so a guide at the apworld root does nothing for such a world.
+        """
+        source = self.build(
+            "demo",
+            "from .world import DemoWorld\n",
+            extra={
+                "world/__init__.py": "from worlds.AutoWorld import World\n\n\n"
+                "class DemoWorld(World):\n" + WORLD_BODY.format(game="Demo"),
+            },
+        )
+        applied, patched = self.repair(source)
+        contents = self.contents(patched)
+
+        self.assertIn(DOCS_MISSING, applied)
+        self.assertIn(f"world/docs/{SETUP_DOC}", contents)
+        self.assertNotIn(f"docs/{SETUP_DOC}", contents)
+        # And the WebWorld went into the subpackage too, not the root module.
+        self.assertIn("class CWWeb(WebWorld):", contents["world/__init__.py"])
+        self.assertTrue(verify_apworld(patched, VERSIONS).installable)
+
+    def test_a_repair_that_leaves_a_name_unbound_is_discarded(self) -> None:
+        """The guard behind both of the above: never install source we cannot vouch for."""
+        from tools.custom_worlds import repair as repair_module
+
+        init = "from worlds.AutoWorld import World\n\n\nclass DemoWorld(World):\n" + WORLD_BODY.format(game="Demo")
+        source = self.build("demo", init)
+        before = verify_apworld(source, VERSIONS)
+        original = repair_module._with_imports
+        try:
+            repair_module._with_imports = lambda text: text  # a repair that forgets the imports
+            patched = self.tmp / "out" / source.name
+            patched.parent.mkdir(exist_ok=True)
+            applied = repair_apworld(source, patched, before.findings)
+        finally:
+            repair_module._with_imports = original
+        self.assertEqual([], applied, "an unusable repair must not be reported as one")
+
+
 class TestAgainstTheBundledWorlds(unittest.TestCase):
     """Core's worlds are all correct, so none of them should look repairable."""
 

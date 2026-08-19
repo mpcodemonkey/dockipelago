@@ -458,7 +458,7 @@ the WebHost insists on, and paperwork can be written:
 | --- | --- |
 | `web-missing` | a `CWWeb(WebWorld)` class above the world, and `web = CWWeb()` inside it |
 | `web-no-tutorials` | the generic tutorial block, into the world's *own* WebWorld wherever it lives |
-| `docs-missing` | `docs/setup_en.md`, so the tutorial points at a file that exists |
+| `docs-missing` | `setup_en.md` in the docs folder that world needs, so the tutorial points at a file that exists |
 
 The block written is the same in both cases:
 
@@ -476,7 +476,14 @@ The block written is the same in both cases:
 ```
 
 `WebWorld` is imported from `worlds.AutoWorld` and `Tutorial` from `BaseClasses` where the module
-does not have them already. `web = CWWeb()` goes in as the first statement of the world's class body
+does not have them already. A star import is deliberately not counted as supplying either name — it
+only *might*, and assuming it did is how two worlds ended up with `class CWWeb(WebWorld)` above no
+import of `WebWorld` and a `NameError` at load. A redundant import is harmless; a skipped one is not.
+
+The docs folder goes **beside the module that defines the World class**, not at the apworld root.
+`AutoWorldRegister` sets `__file__` from that module and the WebHost lists `dirname(__file__)/docs`,
+so a world whose class lives in `world/__init__.py` is asked for `world/docs` and a guide at the root
+does nothing for it. `web = CWWeb()` goes in as the first statement of the world's class body
 — after its docstring where there is one, so it reads the way the world would have written it.
 Whichever module holds the class being changed is the one edited, so a world keeping its WebWorld in
 `web.py` is repaired there rather than in `__init__.py`.
@@ -487,9 +494,10 @@ This edits third-party source, so two rules hold throughout:
 The world's own lines come back byte for byte with new ones between them; nothing is reformatted,
 nothing is deleted, and an existing `setup_en.md` is never overwritten.
 
-**Never trust the result.** A repair is a proposal. The rewritten world is verified again from
-scratch and refused exactly as it would have been if it still fails, so a repair that does not take
-costs nothing. The original staged file is left alone until the copy passes.
+**Never trust the result.** A repair is a proposal. Before anything is written, the rewritten source
+has to parse and every name it leans on has to be bound at module level — a repair that cannot pass
+that is dropped and the world is refused as it would have been. The world is then verified again from
+scratch as well, and the original staged file is left alone until the copy passes.
 
 A world is only repaired when **every** finding against it is on that list. One with anything else
 wrong is refused untouched — repairing half of it would install something still broken, which is
@@ -549,7 +557,7 @@ exactly once:
   "removed": "worlds/some_game",
   "first_rejected": "2026-08-16T23:10:33Z",
   "checked": {
-    "checks_version": 7,
+    "checks_version": 8,
     "archipelago_version": "0.6.8",
     "container_version": 7,
     "webhost_check": "error"

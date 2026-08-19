@@ -177,12 +177,11 @@ def inspect_world(
 
     findings.extend(_check_escapes(label, package))
 
-    has_docs = _has_docs(files)
     for path, name, node in package.world_classes():
         finding = _check_world(path, name, node, package)
         if finding is not None:
             findings.append(finding)
-        if has_docs is False:
+        if _has_docs(path, files) is False:
             docs = _check_docs(label, path, name, node, package, finding)
             if docs is not None:
                 findings.append(docs)
@@ -282,11 +281,39 @@ def _unparseable(
     )
 
 
-def _has_docs(files: Collection[str] | None) -> bool | None:
-    """Whether the world ships a ``docs/`` folder, or None when the caller could not say."""
+def world_modules(modules: Mapping[str, str]) -> list[str]:
+    """The module each registered World class lives in, which is what decides where its docs go."""
+    package = _Package(modules)
+    seen: list[str] = []
+    for path, _name, _node in package.world_classes():
+        if path not in seen:
+            seen.append(path)
+    return seen
+
+
+def docs_folder(module: str, files: Collection[str]) -> str:
+    """Where the WebHost will look for a world's docs, relative to the apworld root.
+
+    Not the package root: ``AutoWorldRegister`` sets ``__file__`` from the module that defines the
+    World class, and ``copy_tutorials_files_to_static()`` then lists ``dirname(__file__)/docs``. A
+    world whose class lives in ``factorio_platformer/world/__init__.py`` is asked for
+    ``factorio_platformer/world/docs``, and putting one at the root does nothing for it.
+    """
+    if not module:
+        return _DOCS
+    as_package = module.replace(".", "/")
+    if f"{as_package}/__init__.py" in files:
+        return f"{as_package}/{_DOCS}"
+    parent = as_package.rsplit("/", 1)[0] if "/" in as_package else ""
+    return f"{parent}/{_DOCS}" if parent else _DOCS
+
+
+def _has_docs(module: str, files: Collection[str] | None) -> bool | None:
+    """Whether the world ships the docs folder this class needs, or None if the caller cannot say."""
     if files is None:
         return None
-    return any(name == f"{_DOCS}/" or name.startswith(f"{_DOCS}/") for name in files)
+    wanted = docs_folder(module, files)
+    return any(name.rstrip("/") == wanted or name.startswith(f"{wanted}/") for name in files)
 
 
 def _check_docs(
