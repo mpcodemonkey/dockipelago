@@ -102,6 +102,9 @@ class WebWorldFinding:
     detail: str
     severity: str
     world_class: str = ""
+    #: Where a repair would have to go: the module, and the class inside it to change.
+    module: str = ""
+    target_class: str = ""
 
     @property
     def blocks_loading(self) -> bool:
@@ -320,6 +323,8 @@ def _check_docs(
         ),
         severity=SEVERITY_WEBHOST,
         world_class=name,
+        module=path,
+        target_class=name,
     )
 
 
@@ -574,6 +579,8 @@ def _check_missing_web(
             f"{_DROPPED_BY_WEBHOST}"
         ),
         severity=SEVERITY_WEBHOST,
+        module=path,
+        target_class=name,
         world_class=name,
     )
 
@@ -600,6 +607,8 @@ def _check_tutorials(world_name: str, webworld: "_Class", package: "_Package") -
             ),
             severity=SEVERITY_WEBHOST,
             world_class=world_name,
+            module=webworld.module,
+            target_class=web_name,
         )
 
     # Anything else is only worth flagging when it is provably not a list. A call is usually a

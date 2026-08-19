@@ -28,6 +28,7 @@ from typing import Any
 from .http import HttpClient, HttpError
 from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
+from .repair import repair_apworld, repairable
 from .validate import validate_installed_worlds
 from .verify import (
     MAX_MODULE_BYTES,
@@ -114,6 +115,8 @@ class GameRecord:
     codes: list[str] = field(default_factory=list)
     #: Path removed from the output directory because what was installed there is now rejected.
     removed: str = ""
+    #: Findings --repair wrote its way out of, so the lockfile records what was not the world's own.
+    repaired: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -141,6 +144,7 @@ class CrawlOptions:
     prune: bool = False
     install_mode: str = INSTALL_EXTRACT
     ignore_game_mismatch: bool = False
+    repair: bool = False
     validate: bool = False
     validate_python: str = sys.executable
     #: Python the image will run. Older than this, a SyntaxError is not proof of a broken world.
@@ -328,14 +332,9 @@ class Crawler:
         staged.parent.mkdir(parents=True, exist_ok=True)
         staged.write_bytes(payload)
 
-        result = verify_apworld(
-            staged,
-            self.versions,
-            webhost_check=self.options.webhost_check,
-            # A missing docs/ folder only stops the WebHost when the world is a folder it lists.
-            check_docs=self.options.install_mode == INSTALL_EXTRACT,
-            syntax_authoritative=self.syntax_authoritative,
-        )
+        result = self._verify(staged)
+        if self.options.repair and not result.installable and repairable(result.findings):
+            result = self._repair(staged, record, result)
         record.verification = result.status
         record.errors.extend(result.errors)
         record.warnings.extend(result.warnings)
@@ -363,6 +362,46 @@ class Crawler:
             f" - {result.game}" if result.game else "",
         )
         return result
+
+    def _verify(self, staged: Path) -> VerificationResult:
+        return verify_apworld(
+            staged,
+            self.versions,
+            webhost_check=self.options.webhost_check,
+            # A missing docs/ folder only stops the WebHost when the world is a folder it lists.
+            check_docs=self.options.install_mode == INSTALL_EXTRACT,
+            syntax_authoritative=self.syntax_authoritative,
+        )
+
+    def _repair(self, staged: Path, record: GameRecord, result: VerificationResult) -> VerificationResult:
+        """Write the WebWorld paperwork a world is missing, and keep the result only if it works.
+
+        The repair is a proposal, never a verdict: the rewritten world is verified again from
+        scratch, and one that still fails is refused exactly as it would have been. A world is only
+        repaired when every finding against it is repairable, so this never installs something with
+        one problem papered over and another left in place.
+        """
+        patched = staged.with_name(f".repaired.{staged.name}")
+        try:
+            applied = repair_apworld(staged, patched, result.findings)
+        except (OSError, zipfile.BadZipFile, ValueError) as error:
+            logger.warning("  could not repair %s: %s", staged.name, error)
+            patched.unlink(missing_ok=True)
+            return result
+        if not applied:
+            patched.unlink(missing_ok=True)
+            return result
+
+        # Verified under the name it will be installed as, since core ties the two together.
+        patched.replace(staged)
+        repaired = self._verify(staged)
+        if not repaired.installable:
+            logger.warning("  repair did not take for %s: %s", record.title, repaired.summary()[:160])
+            return repaired
+
+        record.repaired = sorted(set(applied))
+        logger.info("  repaired %s: %s", record.title, ", ".join(record.repaired))
+        return repaired
 
     def _game_is_right(
         self,
@@ -522,6 +561,8 @@ class Crawler:
             and checked.get("archipelago_version") == self.versions.ap_version_string
             and checked.get("container_version") == self.versions.container_version
             and checked.get("webhost_check") == self.options.webhost_check
+            # Turning --repair on has to reach the worlds an earlier run turned away without it.
+            and bool(checked.get("repair", False)) == self.options.repair
         )
 
     def _remembered_rejection(self, record: GameRecord) -> dict[str, Any] | None:
@@ -755,6 +796,7 @@ def write_lockfile(
         "archipelago_version": versions.ap_version_string,
         "container_version": versions.container_version,
         "webhost_check": options.webhost_check,
+        "repair": options.repair,
     }
     ordered = sorted(records, key=lambda item: item.title.lower())
     # A partial run (--only, --limit) must not erase everything it did not look at. A full one may:
@@ -773,6 +815,7 @@ def write_lockfile(
             "download_url": record.download_url,
             "file": record.file,
             "shared_repo": record.shared_repo,
+            "repaired": record.repaired,
             "install_mode": options.install_mode,
             "sha256": record.sha256,
             "size": record.size,
@@ -797,6 +840,7 @@ def write_lockfile(
         "category": options.category,
         "install_mode": options.install_mode,
         "webhost_check": options.webhost_check,
+        "repair": options.repair,
         "output_dir": str(_relative(options.output_dir, options.root)),
         "worlds": worlds,
         "rejected": rejected,
@@ -1148,6 +1192,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true", help="resolve and report without writing to --output")
     parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="write the WebWorld paperwork a world is missing rather than refusing it: a generic "
+        "tutorial block, a docs/setup_en.md to back it, and a WebWorld class where there is none. "
+        "The repaired world is verified again and still refused if it does not pass",
+    )
+    parser.add_argument(
         "--validate",
         action="store_true",
         help="after installing, run Archipelago's own start-up checks in a subprocess and remove "
@@ -1196,6 +1247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prune=args.prune,
         install_mode=args.install_mode,
         ignore_game_mismatch=args.ignore_game_mismatch,
+        repair=args.repair,
         validate=args.validate,
         validate_python=args.validate_python,
         webhost_check=args.webhost_check,

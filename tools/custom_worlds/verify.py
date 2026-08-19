@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from .webworld import SEVERITY_NOTE, inspect_world, module_path, patch_endings
+from .webworld import SEVERITY_NOTE, WebWorldFinding, inspect_world, module_path, patch_endings
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,8 @@ class VerificationResult:
     codes: list[str] = field(default_factory=list)
     #: Patch file extensions this world registers globally, which two worlds cannot share.
     patch_endings: set[str] = field(default_factory=set)
+    #: The WebWorld findings themselves, which --repair needs to know what to write.
+    findings: list[WebWorldFinding] = field(default_factory=list)
 
     @property
     def module_name(self) -> str:
@@ -291,6 +293,7 @@ def _check_webworld(
     findings = inspect_world(
         modules, module_name=path.stem, files=files, syntax_authoritative=syntax_authoritative
     )
+    result.findings.extend(findings)
     for finding in findings:
         if finding.severity == SEVERITY_NOTE:
             # The world serves; something about it is degraded. Never a reason to refuse it.

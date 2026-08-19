@@ -449,6 +449,63 @@ deliberate about, which is why it is opt-in.
 Static checks stay worth having: they need no dependencies, execute nothing, and catch most of this
 in seconds during the crawl. `--validate` is the backstop for what they cannot see.
 
+## `--repair`: writing the paperwork instead of turning the world away
+
+Three of the things a world gets refused for are not faults in the game at all — they are paperwork
+the WebHost insists on, and paperwork can be written:
+
+| Finding | What `--repair` writes |
+| --- | --- |
+| `web-missing` | a `CWWeb(WebWorld)` class above the world, and `web = CWWeb()` inside it |
+| `web-no-tutorials` | the generic tutorial block, into the world's *own* WebWorld wherever it lives |
+| `docs-missing` | `docs/setup_en.md`, so the tutorial points at a file that exists |
+
+The block written is the same in both cases:
+
+```python
+    setup_en = Tutorial(
+        "Multiworld Setup Guide",
+        "A guide to playing this game with Archipelago.",
+        "English",
+        "setup_en.md",
+        "setup/en",
+        ["ubufugu"]
+    )
+
+    tutorials = [setup_en]
+```
+
+`WebWorld` is imported from `worlds.AutoWorld` and `Tutorial` from `BaseClasses` where the module
+does not have them already. `web = CWWeb()` goes in as the first statement of the world's class body
+— after its docstring where there is one, so it reads the way the world would have written it.
+Whichever module holds the class being changed is the one edited, so a world keeping its WebWorld in
+`web.py` is repaired there rather than in `__init__.py`.
+
+This edits third-party source, so two rules hold throughout:
+
+**Only ever add.** Edits are line insertions located with `ast`, never rewrites of existing text.
+The world's own lines come back byte for byte with new ones between them; nothing is reformatted,
+nothing is deleted, and an existing `setup_en.md` is never overwritten.
+
+**Never trust the result.** A repair is a proposal. The rewritten world is verified again from
+scratch and refused exactly as it would have been if it still fails, so a repair that does not take
+costs nothing. The original staged file is left alone until the copy passes.
+
+A world is only repaired when **every** finding against it is on that list. One with anything else
+wrong is refused untouched — repairing half of it would install something still broken, which is
+worse than a clear refusal. Core's own worlds are checked in the test suite to make sure none of them
+ever looks repairable.
+
+What was written is recorded per world in the lockfile:
+
+```json
+"repaired": ["docs-missing", "web-missing"]
+```
+
+so it is always clear which parts of an installed world came from the crawler rather than from its
+author. The flag is part of each entry's fingerprint too, so turning it on re-checks the worlds an
+earlier run turned away without it.
+
 ## Install modes
 
 By default each apworld is **extracted**: `mygame.apworld` becomes `worlds/mygame/`. Core loads that
@@ -537,6 +594,7 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 | `--allow-prerelease` | accept pre-release GitHub releases |
 | `--ignore-game-mismatch` | install even when the manifest names a different game than the page |
 | `--webhost-check {error,warn,off}` | what to do about worlds the WebHost would drop (default `error`) |
+| `--repair` | write the missing WebWorld/tutorial/docs paperwork rather than refusing the world |
 | `--validate` | after installing, run Archipelago's start-up checks and remove what they reject |
 | `--validate-python PATH` | interpreter to run `--validate` with, when this one lacks Archipelago's requirements |
 | `--recursive` | descend into subcategories |

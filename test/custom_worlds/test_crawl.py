@@ -1244,6 +1244,76 @@ class TestMultiModuleWorlds(CrawlTestCase):
         self.assertTrue((self.world_path("mygame") / "web.py").is_file())
 
 
+class TestRepair(CrawlTestCase):
+    """--repair writes the WebWorld paperwork instead of turning the world away."""
+
+    NO_WEB = (
+        "from worlds.AutoWorld import World\n"
+        'class MyGameWorld(World):\n    game = "Some Game Game"\n'
+    )
+
+    def test_a_world_with_no_webworld_is_refused_without_the_flag(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        record = self.record_for(self.crawl(), "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assert_not_installed("mygame")
+
+    def test_the_same_world_is_repaired_and_installed_with_it(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        record = self.record_for(self.crawl(self.options(repair=True)), "Some Game")
+
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assert_installed("mygame")
+        installed = (self.world_path("mygame") / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("class CWWeb(WebWorld):", installed)
+        self.assertIn("web = CWWeb()", installed)
+        self.assertTrue((self.world_path("mygame") / "docs" / "setup_en.md").is_file())
+
+    def test_what_was_repaired_is_recorded_in_the_lockfile(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        self.crawl(self.options(repair=True))
+        entry = self.lock["worlds"][0]
+        # This fixture already ships docs/, so only the WebWorld had to be written.
+        self.assertEqual(["web-missing"], sorted(entry["repaired"]))
+
+    def test_a_world_with_neither_a_webworld_nor_docs_gets_both(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        make_apworld(
+            self.assets / "mygame.apworld",
+            module="mygame",
+            manifest=default_manifest("Some Game Game"),
+            init_source=self.NO_WEB,
+            docs=False,
+        )
+        self.crawl(self.options(repair=True))
+        self.assertEqual(["docs-missing", "web-missing"], sorted(self.lock["worlds"][0]["repaired"]))
+        self.assertTrue((self.world_path("mygame") / "docs" / "setup_en.md").is_file())
+
+    def test_a_world_that_is_already_fine_is_not_touched(self) -> None:
+        self.add_game("Some Game", init_source=GOOD_WORLD)
+        self.crawl(self.options(repair=True))
+        entry = self.lock["worlds"][0]
+        self.assertEqual([], entry["repaired"])
+        self.assertEqual(GOOD_WORLD, (self.world_path("mygame") / "__init__.py").read_text(encoding="utf-8"))
+
+    def test_a_world_broken_beyond_paperwork_is_still_refused(self) -> None:
+        # Repairing half of it would install something still broken.
+        self.add_game("Some Game", init_source="class MyGameWorld(World)\n    oops\n")
+        record = self.record_for(self.crawl(self.options(repair=True)), "Some Game")
+        self.assertEqual(OUTCOME_SKIPPED, record.outcome)
+        self.assertEqual([], record.repaired)
+        self.assert_not_installed("mygame")
+
+    def test_turning_the_flag_on_reaches_a_world_an_earlier_run_refused(self) -> None:
+        self.add_game("Some Game", init_source=self.NO_WEB)
+        self.crawl()
+        self.assert_not_installed("mygame")
+        # The rejection is remembered, so only re-checking under the new policy can undo it.
+        record = self.record_for(self.crawl(self.options(repair=True)), "Some Game")
+        self.assertEqual(OUTCOME_INSTALLED, record.outcome, record.reason)
+        self.assert_installed("mygame")
+
+
 class TestValidation(CrawlTestCase):
     """The backstop: whatever Archipelago itself rejects is removed and remembered."""
 
