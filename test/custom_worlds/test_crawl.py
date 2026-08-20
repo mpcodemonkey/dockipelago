@@ -23,6 +23,7 @@ from tools.custom_worlds.crawl import (
     GameRecord,
     extract_world,
     write_lockfile,
+    write_report,
 )
 from tools.custom_worlds.releases import GitHubClient
 from tools.custom_worlds.validate import (
@@ -1406,6 +1407,69 @@ class TestValidation(CrawlTestCase):
         # A dry run installs nothing, so there is nothing for validation to take back out either.
         records = self.crawl(self.options(dry_run=True, validate=True))
         self.assertEqual(OUTCOME_RESOLVED, self.record_for(records, "Bad Game").outcome)
+
+
+class TestGenerationReport(CrawlTestCase):
+    """--validate-generation says what could not generate, and leaves everything installed."""
+
+    def crawl_with_generation(self, report: ValidationReport) -> list[GameRecord]:
+        settings = self.options(validate_generation=True)
+        crawler = Crawler(
+            settings,
+            WikiClient(self.http),  # type: ignore[arg-type]
+            GitHubClient(self.http, token=None),  # type: ignore[arg-type]
+            VERSIONS,
+        )
+        records = crawler.run(self.staging)
+        with mock.patch("tools.custom_worlds.crawl.validate_generation", return_value=report):
+            self.passed, self.detail = crawler.report_generation()
+        self.crawler = crawler
+        return records
+
+    def test_a_world_that_cannot_generate_is_reported_but_kept(self) -> None:
+        self.add_game("Some Game", init_source=GOOD_WORLD)
+        report = ValidationReport(
+            ok=True,
+            registered=1,
+            verdicts=[
+                WorldVerdict(
+                    game="Some Game Game",
+                    module="mygame",
+                    status="generation-failed",
+                    reason="FillError: Not enough locations for progression items",
+                )
+            ],
+        )
+        records = self.crawl_with_generation(report)
+
+        self.assertTrue(self.passed)
+        self.assertIn("could not generate", self.detail)
+        # Reported only: the world stays put and its record is untouched.
+        self.assert_installed("mygame")
+        self.assertEqual(OUTCOME_INSTALLED, self.record_for(records, "Some Game").outcome)
+        self.assertEqual("", self.record_for(records, "Some Game").removed)
+
+    def test_a_clean_run_says_nothing_was_wrong(self) -> None:
+        self.add_game("Some Game", init_source=GOOD_WORLD)
+        self.crawl_with_generation(ValidationReport(ok=True, registered=1, verdicts=[]))
+        self.assertTrue(self.passed)
+        self.assertEqual("", self.detail)
+
+    def test_a_check_that_cannot_run_is_an_error(self) -> None:
+        self.add_game("Some Game", init_source=GOOD_WORLD)
+        self.crawl_with_generation(ValidationReport(ok=False, error="no Archipelago here"))
+        self.assertFalse(self.passed)
+        self.assertIn("no Archipelago here", self.detail)
+
+    def test_the_results_reach_the_report_file(self) -> None:
+        self.add_game("Some Game", init_source=GOOD_WORLD)
+        verdict = WorldVerdict(game="Some Game Game", module="mygame", status="unbeatable", reason="no goal")
+        records = self.crawl_with_generation(ValidationReport(ok=True, registered=1, verdicts=[verdict]))
+        destination = self.root / "report.json"
+        write_report(destination, records, generation=self.crawler.generation)
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(payload["games"]))
+        self.assertEqual("unbeatable", payload["generation"]["failures"][0]["status"])
 
 
 class TestArchiveMode(CrawlTestCase):

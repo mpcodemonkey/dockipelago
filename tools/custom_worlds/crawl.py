@@ -29,7 +29,11 @@ from .http import HttpClient, HttpError
 from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
 from .repair import repair_apworld, repairable
-from .validate import validate_installed_worlds
+from .validate import (
+    ValidationReport,
+    validate_generation,
+    validate_installed_worlds,
+)
 from .verify import (
     MAX_MODULE_BYTES,
     MAX_SOURCE_BYTES,
@@ -146,6 +150,7 @@ class CrawlOptions:
     ignore_game_mismatch: bool = False
     repair: bool = False
     validate: bool = False
+    validate_generation: bool = False
     validate_python: str = sys.executable
     #: Python the image will run. Older than this, a SyntaxError is not proof of a broken world.
     target_python: tuple[int, int] | None = None
@@ -177,6 +182,8 @@ class Crawler:
         self.github = github
         self.versions = versions
         self.records: list[GameRecord] = []
+        #: Filled in by report_generation, for the run report.
+        self.generation: ValidationReport | None = None
         target = options.target_python
         #: Whether this interpreter can be trusted to judge a world's syntax. A world may use syntax
         #: newer than the Python running the crawler, and refusing it would cost a working world.
@@ -490,6 +497,34 @@ class Crawler:
         record.world_version = str(previous.get("world_version") or "")
         record.verification = str(previous.get("verification") or STATUS_OK)
         return True
+
+    def report_generation(self) -> tuple[bool, str]:
+        """Ask every installed world for a seed, and report which ones cannot produce one.
+
+        Report-only on purpose. A world can fail here for reasons that are not faults - needing
+        non-default options, or a setting this checkout has no value for - and one solo seed with
+        default options is a smoke test rather than a verdict. Removing worlds on that evidence
+        would cost working games, so this says what happened and leaves the decision alone.
+        """
+        report = validate_generation(self.options.root, python=self.options.validate_python)
+        if not report.ok:
+            return False, report.error
+
+        self.generation = report
+        failures = report.verdicts
+        logger.info("")
+        if not failures:
+            logger.info("All %d world(s) generated a solo seed", report.registered)
+            return True, ""
+
+        logger.warning(
+            "%d of %d world(s) could not generate a solo seed (reported, not removed):",
+            len(failures),
+            report.registered,
+        )
+        for verdict in sorted(failures, key=lambda item: (item.status, item.game.lower())):
+            logger.warning("  %-34s %-18s %s", verdict.game[:34], verdict.status, verdict.reason[:90])
+        return True, f"{len(failures)} world(s) could not generate a solo seed"
 
     def validate_and_remove(self) -> tuple[bool, str]:
         """Run Archipelago's own start-up checks and take out whatever they reject.
@@ -904,8 +939,27 @@ def _rejected_entries(
     return entries
 
 
-def write_report(path: Path, records: Sequence[GameRecord]) -> None:
-    payload = [asdict(record) for record in sorted(records, key=lambda item: item.title.lower())]
+def write_report(
+    path: Path, records: Sequence[GameRecord], *, generation: "ValidationReport | None" = None
+) -> None:
+    """Write the per-game report, plus the generation results when that check ran.
+
+    Kept as an object rather than a bare list once there is more than one kind of result, so a
+    reader can tell a world that failed to install from one that installed and cannot generate.
+    """
+    games = [asdict(record) for record in sorted(records, key=lambda item: item.title.lower())]
+    if generation is None:
+        payload: Any = games
+    else:
+        payload = {
+            "games": games,
+            "generation": {
+                "ok": generation.ok,
+                "error": generation.error,
+                "registered": generation.registered,
+                "failures": [asdict(verdict) for verdict in generation.verdicts],
+            },
+        }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     logger.info("Wrote %s", path)
 
@@ -1211,6 +1265,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="interpreter to run --validate with; it needs Archipelago's own requirements "
         "installed (default: the one running this script)",
     )
+    parser.add_argument(
+        "--validate-generation",
+        action="store_true",
+        help="after installing, ask every world for a solo seed and report which cannot produce "
+        "one. Reports only - nothing is removed, since one seed with default options is a smoke "
+        "test rather than a verdict (this runs the worlds' whole generation path)",
+    )
     parser.add_argument("--report", type=Path, help="write a detailed JSON report to this path")
     parser.add_argument("--github-token", default=None, help="GitHub token (defaults to $GITHUB_TOKEN / $GH_TOKEN)")
     parser.add_argument("--timeout", type=float, default=30.0, help="per-request timeout in seconds")
@@ -1249,6 +1310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ignore_game_mismatch=args.ignore_game_mismatch,
         repair=args.repair,
         validate=args.validate,
+        validate_generation=args.validate_generation,
         validate_python=args.validate_python,
         webhost_check=args.webhost_check,
         max_asset_bytes=args.max_asset_bytes,
@@ -1281,9 +1343,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif detail:
             logger.info(detail)
 
+    if options.validate_generation and not options.dry_run:
+        passed, detail = crawler.report_generation()
+        if not passed:
+            logger.error("generation check could not run: %s", detail)
+            exit_code = 1
+
     log_summary(records)
     if args.report:
-        write_report(args.report, records)
+        write_report(args.report, records, generation=crawler.generation)
 
     if not options.dry_run:
         write_lockfile(

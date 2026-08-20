@@ -514,6 +514,55 @@ so it is always clear which parts of an installed world came from the crawler ra
 author. The flag is part of each entry's fingerprint too, so turning it on re-checks the worlds an
 earlier run turned away without it.
 
+## `--validate-generation`: can these worlds actually make a seed?
+
+Everything else checks whether a world *loads and serves*. This checks the only thing a player ever
+does with one: asks it for a seed. A world can import, register, pass every WebHost filter, appear on
+the site — and still fail the moment someone tries to generate with it.
+
+No server is involved. Generation is a batch process and the WebHost only hosts a room once a seed
+exists, so this runs Archipelago's own `setup_solo_multiworld` through the standard generation steps,
+then `distribute_items_restrictive`, then asks whether the result is beatable and fully reachable.
+
+```bash
+python tools/crawl_custom_worlds.py --validate-generation
+```
+
+| Verdict | What happened |
+| --- | --- |
+| `generation-failed` | a gen step raised, or the fill could not place the items |
+| `generation-timeout` | still generating after the per-world limit |
+| `unbeatable` | it produced a seed whose goal cannot be reached |
+| `unreachable` | it produced a seed with locations no player can reach |
+
+It is cheap: all 79 non-hidden worlds bundled with Archipelago generate in about 15 seconds, median
+0.02s each, the slowest under two.
+
+**This reports; it never removes.** That is not caution for its own sake — a single failure turned
+out to be poor evidence, twice over:
+
+- The sweep shares one interpreter between every world, and worlds are not always tidy with global
+  state. Core's own SMZ3 failed in the sweep having been blamed for something an earlier world left
+  behind.
+- Generation is less deterministic than its seed suggests. That same world generates happily on five
+  seeds in one execution context and fails on the first seed in another, for reasons this does not
+  try to settle.
+
+So a failure is only reported once the world has failed **alone, in a fresh process, on every seed
+tried**. Only failures pay that cost, and after it core's worlds report nothing at all. Even then,
+one solo seed with default options is a smoke test rather than a verdict: a world can pass here and
+still fail under different options or alongside other players, and a world that legitimately needs
+non-default options may fail here while being perfectly fine. Read the list, do not act on it blindly.
+
+Archipelago's own hidden placeholder world and the fixture worlds that appear when its test helpers
+are imported are both left out, since neither is a game anybody installs.
+
+This runs a world's whole generation path, which is considerably more third-party code than
+[`--validate`](#--validate-asking-archipelago-instead-of-guessing) executes. That is why it is a
+separate flag rather than another step.
+
+`--report FILE` includes the results, alongside the per-game records.
+
 ## Install modes
 
 By default each apworld is **extracted**: `mygame.apworld` becomes `worlds/mygame/`. Core loads that
@@ -604,6 +653,7 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 | `--webhost-check {error,warn,off}` | what to do about worlds the WebHost would drop (default `error`) |
 | `--repair` | write the missing WebWorld/tutorial/docs paperwork rather than refusing the world |
 | `--validate` | after installing, run Archipelago's start-up checks and remove what they reject |
+| `--validate-generation` | ask every world for a solo seed and report which cannot (removes nothing) |
 | `--validate-python PATH` | interpreter to run `--validate` with, when this one lacks Archipelago's requirements |
 | `--recursive` | descend into subcategories |
 | `--strict` | exit non-zero if any game failed |
