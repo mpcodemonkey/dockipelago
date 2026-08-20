@@ -76,9 +76,14 @@ automatically built image with:
 docker pull ubufugu/dockipelago:nightly
 ```
 
-Docker Hub authentication uses the `DOCKERHUB_TOKEN` repository secret. Where that secret is not
-readable — a pull request from a fork — the login and the Docker Hub tags are both skipped, so those
-builds still produce their GHCR images rather than failing on a login they were never going to make.
+Docker Hub authentication uses two repository secrets, `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+The account they name does not have to be the one that owns the namespace above — an access token
+belonging to any account with push rights to it will do — which is why the username is a secret
+rather than a name written into the workflow.
+
+Both are required. Where either cannot be read — a pull request from a fork — the login and the
+Docker Hub tags are skipped together, so those builds still produce their GHCR images rather than
+failing on a login they were never going to make.
 
 ---
 

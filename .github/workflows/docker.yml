@@ -100,8 +100,9 @@ jobs:
       packages: write
     env:
       # The secrets context cannot be read from a step's `if`, so the one thing the steps need to
-      # know about it is decided here, where it can be.
-      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+      # know about the credential is decided here, where it can be. Both halves are required: a
+      # token without the username it belongs to authenticates nothing.
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     strategy:
       matrix:
         include:
@@ -133,7 +134,7 @@ jobs:
         if: env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
         with:
-          username: ubufugu
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Compute suffixed tags
@@ -177,7 +178,7 @@ jobs:
       contents: read
       packages: write
     env:
-      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
@@ -190,7 +191,7 @@ jobs:
         if: env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
         with:
-          username: ubufugu
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest
