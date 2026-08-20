@@ -17,10 +17,11 @@ One directory, one tool, and the file that ties them together:
   **`custom_worlds.lock.json`** records what it installed, from which repository and release, so any
   world in `worlds/` can be traced back to a wiki page and a tag.
 
-Beyond those, this section of the README and the crawler's own documentation, nothing diverges from
-upstream — no patches to `WebHost.py`, `settings.py` or any bundled world. That is deliberate: it
-keeps merging upstream changes cheap, and it means a world that misbehaves here would misbehave on
-stock Archipelago too.
+Beyond those, this section of the README, the crawler's own documentation, and the Docker Hub steps
+added to `.github/workflows/docker.yml`, nothing diverges from upstream — no patches to
+`WebHost.py`, `settings.py`, the `Dockerfile` or any bundled world. That is deliberate: it keeps
+merging upstream changes cheap, and it means a world that misbehaves here would misbehave on stock
+Archipelago too.
 
 ## Refreshing the custom worlds
 
@@ -58,19 +59,26 @@ docker build -t dockipelago .
 docker run --rm -p 80:80 dockipelago
 ```
 
-`.github/workflows/docker.yml` is also upstream's. It builds `amd64` and `arm64` and pushes to the
-**GitHub Container Registry**:
+`.github/workflows/docker.yml` builds `amd64` and `arm64` and publishes to two registries:
 
-| Trigger | Tag |
-| --- | --- |
-| push to `main` | `ghcr.io/mpcodemonkey/dockipelago:nightly` |
-| tag `v1.2.3` | `:1.2.3`, `:1.2`, and `:latest` |
-| manual run | whatever the branch resolves to |
+| Trigger | GitHub Container Registry | Docker Hub |
+| --- | --- | --- |
+| push to `main` | `ghcr.io/mpcodemonkey/dockipelago:nightly` | `ubufugu/dockipelago:nightly` |
+| tag `v1.2.3` | `:1.2.3`, `:1.2`, and `:latest` | *nothing* |
 
-**Publishing to Docker Hub is not set up yet.** `ubufugu/dockipelago:latest` is the intended
-destination but nothing pushes there — the inherited workflow authenticates to GHCR with the
-automatic `GITHUB_TOKEN` and has no Docker Hub credentials. Wiring it up needs a Docker Hub access
-token in the repository secrets and a second login/push step in that workflow.
+**Docker Hub only ever receives `nightly`.** `ubufugu/dockipelago:latest` is published by hand and no
+automated build moves it — not even a version tag. That is structural rather than a convention to
+remember: the Docker Hub tags come from their own `metadata-action` step with `flavor: latest=false`
+and a single `nightly` rule, so there is no path by which `latest` can be produced. Pull the
+automatically built image with:
+
+```bash
+docker pull ubufugu/dockipelago:nightly
+```
+
+Docker Hub authentication uses the `DOCKERHUB_TOKEN` repository secret. Where that secret is not
+readable — a pull request from a fork — the login and the Docker Hub tags are both skipped, so those
+builds still produce their GHCR images rather than failing on a login they were never going to make.
 
 ---
 

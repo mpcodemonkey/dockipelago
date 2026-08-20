@@ -18,6 +18,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  # Docker Hub is published to as well, but only ever as :nightly - see the metadata step below.
+  DOCKERHUB_IMAGE: ubufugu/dockipelago
 
 permissions: {}
 
@@ -29,6 +31,7 @@ jobs:
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
       package-name: ${{ steps.package.outputs.name }}
+      hub-tags: ${{ steps.hub-meta.outputs.tags }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
@@ -52,6 +55,20 @@ jobs:
             type=ref,event=branch,enable={{is_not_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=nightly,enable={{is_default_branch}}
+
+      # Deliberately separate from the GHCR metadata above rather than a second entry in its
+      # images list. That one runs with the default latest=auto flavor, which would move
+      # ubufugu/dockipelago:latest on every version tag; latest there is published by hand and must
+      # not be touched by an automated build. latest=false makes that structural rather than
+      # something to remember, and nightly is the only rule this one carries.
+      - name: Extract Docker Hub metadata
+        id: hub-meta
+        uses: docker/metadata-action@v6.0.0
+        with:
+          images: ${{ env.DOCKERHUB_IMAGE }}
+          flavor: latest=false
+          tags: |
             type=raw,value=nightly,enable={{is_default_branch}}
 
       - name: Compute final tags
@@ -106,14 +123,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Skipped where the secret is not readable - a pull request from a fork - so those builds
+      # still produce their GHCR images instead of failing on a login they were never going to make.
+      - name: Log in to Docker Hub
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
+        with:
+          username: ubufugu
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Compute suffixed tags
         id: tags
+        env:
+          GHCR_TAGS: ${{ needs.prepare.outputs.tags }}
+          HUB_TAGS: ${{ needs.prepare.outputs.hub-tags }}
+          PUSH_TO_HUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
-          readarray -t tags <<< "${{ needs.prepare.outputs.tags }}"
+          # Read through the environment rather than interpolating tag text straight into the
+          # script, and drop blanks: the Docker Hub list is empty off the default branch.
           suffixed=()
-          for t in "${tags[@]}"; do
-            suffixed+=("$t-${{ matrix.suffix }}")
-          done
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] && suffixed+=("$tag-$SUFFIX")
+          done <<< "$GHCR_TAGS"
+          if [[ "$PUSH_TO_HUB" == "true" ]]; then
+            while IFS= read -r tag; do
+              [[ -n "$tag" ]] && suffixed+=("$tag-$SUFFIX")
+            done <<< "$HUB_TAGS"
+          fi
           echo "tags=$(IFS=','; echo "${suffixed[*]}")" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
@@ -143,14 +180,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifest
-        run: |
-          readarray -t tag_array <<< "${{ needs.prepare.outputs.tags }}"
+      - name: Log in to Docker Hub
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
+        with:
+          username: ubufugu
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-          for tag in "${tag_array[@]}"; do
+      - name: Create and push multi-arch manifest
+        env:
+          GHCR_TAGS: ${{ needs.prepare.outputs.tags }}
+          HUB_TAGS: ${{ needs.prepare.outputs.hub-tags }}
+          PUSH_TO_HUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          tags=()
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] && tags+=("$tag")
+          done <<< "$GHCR_TAGS"
+          if [[ "$PUSH_TO_HUB" == "true" ]]; then
+            while IFS= read -r tag; do
+              [[ -n "$tag" ]] && tags+=("$tag")
+            done <<< "$HUB_TAGS"
+          fi
+
+          for tag in "${tags[@]}"; do
             docker manifest create "$tag" \
               "$tag-amd64" \
               "$tag-arm64"
-            
+
             docker manifest push "$tag"
           done
