@@ -98,6 +98,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # The secrets context cannot be read from a step's `if`, so the one thing the steps need to
+      # know about it is decided here, where it can be.
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
     strategy:
       matrix:
         include:
@@ -126,7 +130,7 @@ jobs:
       # Skipped where the secret is not readable - a pull request from a fork - so those builds
       # still produce their GHCR images instead of failing on a login they were never going to make.
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        if: env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
         with:
           username: ubufugu
@@ -137,7 +141,7 @@ jobs:
         env:
           GHCR_TAGS: ${{ needs.prepare.outputs.tags }}
           HUB_TAGS: ${{ needs.prepare.outputs.hub-tags }}
-          PUSH_TO_HUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+          PUSH_TO_HUB: ${{ env.HAS_DOCKERHUB }}
           SUFFIX: ${{ matrix.suffix }}
         run: |
           # Read through the environment rather than interpolating tag text straight into the
@@ -172,6 +176,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
@@ -181,7 +187,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        if: env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2  # v4.0.0
         with:
           username: ubufugu
@@ -191,7 +197,7 @@ jobs:
         env:
           GHCR_TAGS: ${{ needs.prepare.outputs.tags }}
           HUB_TAGS: ${{ needs.prepare.outputs.hub-tags }}
-          PUSH_TO_HUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+          PUSH_TO_HUB: ${{ env.HAS_DOCKERHUB }}
         run: |
           tags=()
           while IFS= read -r tag; do
