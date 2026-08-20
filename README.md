@@ -1,3 +1,79 @@
+# dockipelago
+
+A fork of [Archipelago](https://github.com/ArchipelagoMW/Archipelago) that ships the community's
+custom worlds in the box. Upstream's Docker image serves the games Archipelago itself supports; this
+one additionally serves the several hundred worlds listed on the wiki's
+[Custom games](https://archipelago.miraheze.org/wiki/Category:Custom_games) page.
+
+Everything below this section is upstream's README, unchanged.
+
+## What is different here
+
+One directory, one tool, and the file that ties them together:
+
+- **`worlds/`** holds the custom worlds as well as the bundled ones. The custom ones are *generated*,
+  not written by hand — do not edit them, since the next crawl overwrites them.
+- **`tools/crawl_custom_worlds.py`** is what puts them there, and
+  **`custom_worlds.lock.json`** records what it installed, from which repository and release, so any
+  world in `worlds/` can be traced back to a wiki page and a tag.
+
+Beyond those, this section of the README and the crawler's own documentation, nothing diverges from
+upstream — no patches to `WebHost.py`, `settings.py` or any bundled world. That is deliberate: it
+keeps merging upstream changes cheap, and it means a world that misbehaves here would misbehave on
+stock Archipelago too.
+
+## Refreshing the custom worlds
+
+```bash
+export GITHUB_TOKEN=ghp_...          # the category is far larger than the unauthenticated rate limit
+
+python tools/crawl_custom_worlds.py --repair --validate
+```
+
+That walks the wiki category, resolves each game's download link to a GitHub release, verifies every
+`.apworld` against this checkout's Archipelago version, and installs the ones that pass into
+`worlds/`. `--repair` writes the WebWorld boilerplate a world is missing rather than turning it away;
+`--validate` then runs Archipelago's own start-up sequence and removes anything it rejects.
+
+Run it on the same Python the image uses (**3.12**) — an older interpreter cannot tell a world using
+newer syntax from a broken one, and the crawler will say so if it is running one.
+
+**The results have to be committed.** The image is built with `COPY . .`, so `worlds/` is baked in at
+build time; a crawl that is not committed changes nothing about the published image.
+
+`--validate-generation` additionally asks every installed world for a solo seed and reports which
+cannot produce one. It removes nothing, because a single failed generation is weak evidence.
+
+Full documentation — how download links are resolved, what each check exists to prevent, the lockfile
+format, and every flag — is in **[docs/custom worlds crawler.md](docs/custom%20worlds%20crawler.md)**.
+
+## The Docker image
+
+The `Dockerfile` is upstream's, unmodified. It builds the WebHost and serves it with
+`python WebHost.py`, and because it copies the whole checkout it ships whatever is in `worlds/` at
+build time. So the release cycle is: crawl, commit, build.
+
+```bash
+docker build -t dockipelago .
+docker run --rm -p 80:80 dockipelago
+```
+
+`.github/workflows/docker.yml` is also upstream's. It builds `amd64` and `arm64` and pushes to the
+**GitHub Container Registry**:
+
+| Trigger | Tag |
+| --- | --- |
+| push to `main` | `ghcr.io/mpcodemonkey/dockipelago:nightly` |
+| tag `v1.2.3` | `:1.2.3`, `:1.2`, and `:latest` |
+| manual run | whatever the branch resolves to |
+
+**Publishing to Docker Hub is not set up yet.** `ubufugu/dockipelago:latest` is the intended
+destination but nothing pushes there — the inherited workflow authenticates to GHCR with the
+automatic `GITHUB_TOKEN` and has no Docker Hub credentials. Wiring it up needs a Docker Hub access
+token in the repository secrets and a second login/push step in that workflow.
+
+---
+
 # [Archipelago](https://archipelago.gg) ![Discord Shield](https://discordapp.com/api/guilds/731205301247803413/widget.png?style=shield) | [Install](https://github.com/ArchipelagoMW/Archipelago/releases)
 
 Archipelago provides a generic framework for developing multiworld capability for game randomizers. In all cases,
