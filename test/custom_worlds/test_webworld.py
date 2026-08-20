@@ -7,6 +7,7 @@ with that mistake in it. ``web = MyWeb`` raises ``AssertionError: WebWorld has t
 ``WebHost.py``, whose filter is literally ``hasattr(world.web, "tutorials")``.
 """
 
+import ast
 import unittest
 from pathlib import Path
 
@@ -758,9 +759,21 @@ class TestWorldsCoreWouldRegister(WebWorldTestCase):
 
 
 class TestSyntaxAuthority(WebWorldTestCase):
-    """A SyntaxError only proves a world is broken if this Python is as new as the image's."""
+    """A SyntaxError only proves a world is broken if this Python is as new as the image's.
 
-    BROKEN = "type Alias = int | str\n"  # valid on 3.12, a SyntaxError before it
+    What is under test is the severity given to a module that will not parse, so the fixture has to
+    be one that will not parse anywhere. That is easy to get wrong: this was written as
+    ``type Alias = int | str``, chosen precisely because 3.11 rejects it - and 3.12 accepts it, so
+    the fixture quietly became valid and both tests failed everywhere the image's own Python runs.
+    ``test_the_fixture_is_broken_on_every_python`` is here to make that impossible to repeat.
+    """
+
+    BROKEN = "def (:\n"
+
+    def test_the_fixture_is_broken_on_every_python(self) -> None:
+        # No version-dependent syntax: whatever interpreter runs this must reject it.
+        with self.assertRaises(SyntaxError):
+            ast.parse(self.BROKEN)
 
     def test_an_authoritative_interpreter_refuses_the_world(self) -> None:
         findings = inspect_world({ROOT: self.BROKEN}, module_name="w", syntax_authoritative=True)
