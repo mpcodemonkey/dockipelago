@@ -217,3 +217,38 @@ jobs:
 
             docker manifest push "$tag"
           done
+
+      # The overview names the upstream commit this was built on, which needs upstream's history.
+      # Fetched without blobs and only for main: enough for merge-base, a fraction of the download.
+      - name: Check out for the Docker Hub overview
+        if: env.HAS_DOCKERHUB == 'true' && github.ref_name == github.event.repository.default_branch
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream history
+        if: env.HAS_DOCKERHUB == 'true' && github.ref_name == github.event.repository.default_branch
+        continue-on-error: true
+        run: |
+          git remote add upstream https://github.com/ArchipelagoMW/Archipelago.git
+          git fetch --filter=blob:none --no-tags upstream main
+
+      # Written to a file rather than published from Python: the generator talks to nothing, so it
+      # stays runnable and testable without credentials.
+      - name: Build the Docker Hub overview
+        if: env.HAS_DOCKERHUB == 'true' && github.ref_name == github.event.repository.default_branch
+        run: |
+          python3 tools/dockerhub_overview.py \
+            --output "$RUNNER_TEMP/overview.md" \
+            --image "${{ env.DOCKERHUB_IMAGE }}" \
+            --repository "${{ github.repository }}" \
+            --branch "${{ github.event.repository.default_branch }}"
+
+      - name: Update the Docker Hub overview
+        if: env.HAS_DOCKERHUB == 'true' && github.ref_name == github.event.repository.default_branch
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_IMAGE }}
+          readme-filepath: ${{ runner.temp }}/overview.md

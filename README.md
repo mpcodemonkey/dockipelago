@@ -85,6 +85,31 @@ Both are required. Where either cannot be read — a pull request from a fork �
 Docker Hub tags are skipped together, so those builds still produce their GHCR images rather than
 failing on a login they were never going to make.
 
+### The Docker Hub overview
+
+`tools/dockerhub_overview.py` writes the description shown on the Docker Hub page, and the workflow
+publishes it after the image is pushed. It names the Archipelago commit the image was built on, how
+many custom worlds came with it, and which of those worlds had boilerplate written for them by the
+crawler.
+
+What it deliberately leaves out is the list of games. Docker Hub caps the description at 25,000
+characters, and naming every world with its version and source repository comes to roughly 62,000 at
+580 worlds, so the full list lives in the lockfile and the page links to it. The generator holds
+itself to the limit: the only section that grows without bound is the repaired table, which is
+trimmed to fit and then reduced to a one-line summary rather than ever producing a description
+Docker Hub would reject.
+
+It talks to nothing, so it can be run and read at any time:
+
+```bash
+python tools/dockerhub_overview.py            # to standard output
+```
+
+The upstream commit comes from `git merge-base HEAD upstream/main`, which needs upstream's history —
+the workflow fetches it without blobs for that one step. Where it cannot be resolved the section is
+omitted rather than guessed at, since a description naming the wrong commit would be worse than one
+naming none.
+
 ---
 
 # [Archipelago](https://archipelago.gg) ![Discord Shield](https://discordapp.com/api/guilds/731205301247803413/widget.png?style=shield) | [Install](https://github.com/ArchipelagoMW/Archipelago/releases)
