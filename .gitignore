@@ -66,6 +66,10 @@ Output Logs/
 /datapackage
 /datapackage_export.json
 /custom_worlds
+
+# Written by tools/crawl_custom_worlds.py. The worlds it installs are ignored by
+# worlds/.gitignore, which the crawler writes too; everyone builds their own set.
+/custom_worlds.lock.json
 # stubgen output
 /out/
 

@@ -25,6 +25,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .docker import DEFAULT_IMAGE, DEFAULT_TAG, TOKEN_ENV, USERNAME_ENV, DockerOptions
+from .docker import run as run_docker
 from .http import HttpClient, HttpError
 from .matching import matches
 from .releases import ApworldAsset, GitHubClient, Resolution, ResolutionError, resolve_assets
@@ -151,6 +153,7 @@ class CrawlOptions:
     repair: bool = False
     validate: bool = False
     validate_generation: bool = False
+    docker: DockerOptions = field(default_factory=DockerOptions)
     validate_python: str = sys.executable
     #: Python the image will run. Older than this, a SyntaxError is not proof of a broken world.
     target_python: tuple[int, int] | None = None
@@ -777,6 +780,41 @@ class Crawler:
 
         if self.options.prune:
             self._prune(output, installed)
+        self._write_ignore()
+
+    def _write_ignore(self) -> None:
+        """Keep the installed worlds out of git, without a hand-maintained list.
+
+        These are third-party sources, several hundred of them, and upstream's own CI would lint and
+        test them as though they were ours - flake8 and mypy over every changed file, and the
+        per-world sweeps in test/general. Committing them breaks all of that, so the tree stays
+        clean and everyone builds their own set from the wiki.
+
+        The file names itself first, so it does not show up as a change either. A world removed from
+        the output directory drops out of the list on the next run, since the list is rebuilt from
+        what is installed rather than appended to.
+        """
+        output = self.options.output_dir
+        installed = sorted(
+            {Path(str(entry["file"])).name for entry in self.previous.values() if entry.get("file")}
+            | {Path(record.file).name for record in self.records if record.succeeded and record.file}
+        )
+        if not installed:
+            return
+        lines = [
+            "# Written by tools/crawl_custom_worlds.py - do not edit.",
+            "#",
+            "# The worlds a crawl installs are third-party source, and upstream's CI lints and tests",
+            "# everything in this repository as though it were ours. They stay out of git; run the",
+            "# crawler to get your own set.",
+            "/.gitignore",
+            *(f"/{name}" for name in installed),
+            "",
+        ]
+        try:
+            (output / ".gitignore").write_text("\n".join(lines), encoding="utf-8")
+        except OSError as error:
+            logger.warning("could not write %s/.gitignore: %s", output, error)
 
     def _prune(self, output: Path, installed: set[Path]) -> None:
         """Delete worlds a previous run installed that this run no longer wants.
@@ -1272,6 +1310,29 @@ def build_parser() -> argparse.ArgumentParser:
         "one. Reports only - nothing is removed, since one seed with default options is a smoke "
         "test rather than a verdict (this runs the worlds' whole generation path)",
     )
+    parser.add_argument(
+        "--docker-build",
+        action="store_true",
+        help="after installing, build the Docker image from the tree this run produced",
+    )
+    parser.add_argument(
+        "--docker-push",
+        action="store_true",
+        help="build and publish the image. Credentials come from the environment only: "
+        f"${USERNAME_ENV} and ${TOKEN_ENV}, the latter never accepted as a flag",
+    )
+    parser.add_argument(
+        "--docker-image",
+        default=DEFAULT_IMAGE,
+        help=f"image to tag (default: {DEFAULT_IMAGE!r}); pushing needs a namespace, as in you/dockipelago",
+    )
+    parser.add_argument("--docker-tag", default=DEFAULT_TAG, help=f"tag to build (default: {DEFAULT_TAG!r})")
+    parser.add_argument(
+        "--docker-description",
+        action="store_true",
+        help="after pushing, replace the repository description on Docker Hub with one built from "
+        "the lockfile",
+    )
     parser.add_argument("--report", type=Path, help="write a detailed JSON report to this path")
     parser.add_argument("--github-token", default=None, help="GitHub token (defaults to $GITHUB_TOKEN / $GH_TOKEN)")
     parser.add_argument("--timeout", type=float, default=30.0, help="per-request timeout in seconds")
@@ -1311,6 +1372,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         repair=args.repair,
         validate=args.validate,
         validate_generation=args.validate_generation,
+        docker=DockerOptions(
+            build=args.docker_build or args.docker_push,
+            push=args.docker_push,
+            describe=args.docker_description,
+            image=args.docker_image,
+            tag=args.docker_tag,
+        ),
         validate_python=args.validate_python,
         webhost_check=args.webhost_check,
         max_asset_bytes=args.max_asset_bytes,
@@ -1348,6 +1416,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not passed:
             logger.error("generation check could not run: %s", detail)
             exit_code = 1
+
+    if options.docker.wanted and not options.dry_run:
+        # Last, so the image is built from whatever survived every check above it.
+        built, detail = run_docker(root, options.docker)
+        if not built:
+            logger.error("%s", detail)
+            exit_code = 1
+        elif detail:
+            logger.info("%s", detail)
 
     log_summary(records)
     if args.report:

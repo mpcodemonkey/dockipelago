@@ -639,6 +639,79 @@ for a per-page JSON report including the games that failed and why.
 pages they did not visit keep their existing entries in both lists, and `--prune` leaves those worlds
 alone. Only a full crawl treats a page's absence from the run as its absence from the wiki.
 
+## The tree stays clean
+
+Nothing a crawl writes is committed. The installed worlds are third-party source, several hundred of
+them, and upstream's CI treats everything in the repository as ours: `analyze-modified-files.yml`
+runs flake8 and mypy over every changed `.py`, and `unittests.yml` runs the per-world sweeps in
+`test/general` over every registered world. Committing a crawl puts thousands of files that were
+never written to those standards through both, and breaks the checks that make merging upstream
+safe.
+
+So each run writes `worlds/.gitignore` naming exactly what it installed:
+
+```
+# Written by tools/crawl_custom_worlds.py - do not edit.
+#
+# The worlds a crawl installs are third-party source, and upstream's CI lints and tests
+# everything in this repository as though it were ours. They stay out of git; run the
+# crawler to get your own set.
+/.gitignore
+/a_hat_in_time_2
+/ahit_wildcard
+…
+```
+
+The file names itself first, so it is not a change either. The list is rebuilt each run from the
+lockfile plus what this run installed, rather than appended to, so a world that is removed drops out
+of it. `custom_worlds.lock.json` is ignored by the repository's own `.gitignore`. `git status` after
+a full crawl is empty.
+
+Which means the image cannot be built from a checkout by itself — the worlds only exist where the
+crawl ran.
+
+## Building the image
+
+`--docker-build` builds the image from the tree the run just produced, as the last step of the run —
+after installing, after `--repair`, after `--validate` has removed whatever it rejected. It needs no
+account:
+
+```bash
+python tools/crawl_custom_worlds.py --repair --validate --docker-build
+docker run --rm -p 80:80 dockipelago:nightly
+```
+
+`--docker-push` builds and publishes. `--docker-image` and `--docker-tag` set what to call it;
+publishing needs a namespace, since `dockipelago:nightly` is not a name Docker Hub will accept a
+push for:
+
+```bash
+export DOCKERHUB_USERNAME=you
+export DOCKERHUB_TOKEN=dckr_pat_…
+
+python tools/crawl_custom_worlds.py --repair --validate \
+    --docker-push --docker-image you/dockipelago
+```
+
+**Credentials are read from the environment only.** `DOCKERHUB_TOKEN` is deliberately not a flag: an
+argument is readable in the process list by any other user on the machine, and stays in the shell
+history of whoever ran the command. It reaches `docker login` on stdin and nowhere else. Nothing
+about any account lives in this repository.
+
+Anything that would stop a push is checked *before* the build starts — a missing credential, or an
+image name without a namespace — because a build takes minutes and finding out afterwards that there
+was never a credential to push with wastes all of them.
+
+`--docker-description` replaces the repository's description on Docker Hub, after a successful push,
+with one built from the lockfile: the Archipelago commit the image was built on, how many worlds it
+carries, and which of them needed `--repair`. Docker Hub caps a description at 25,000 characters, so
+the generator degrades rather than failing — the full game table first, then a truncated one, then a
+one-line summary. `tools/dockerhub_overview.py` writes the same text to a file without talking to
+anything, which is the way to see what would be published. A description that fails to update does
+not turn a successful push into a failure; the image is the point.
+
+`--dry-run` skips all of this, since there would be nothing new to build from.
+
 ## Useful options
 
 | Option | Effect |
@@ -655,6 +728,11 @@ alone. Only a full crawl treats a page's absence from the run as its absence fro
 | `--validate` | after installing, run Archipelago's start-up checks and remove what they reject |
 | `--validate-generation` | ask every world for a solo seed and report which cannot (removes nothing) |
 | `--validate-python PATH` | interpreter to run `--validate` with, when this one lacks Archipelago's requirements |
+| `--docker-build` | build the image from the tree this run produced |
+| `--docker-push` | build and publish it (`$DOCKERHUB_USERNAME` / `$DOCKERHUB_TOKEN`) |
+| `--docker-image NAME` | image to tag (default `dockipelago`; pushing needs `you/dockipelago`) |
+| `--docker-tag TAG` | tag to build (default `nightly`) |
+| `--docker-description` | after pushing, rewrite the Docker Hub description from the lockfile |
 | `--recursive` | descend into subcategories |
 | `--strict` | exit non-zero if any game failed |
 | `--keep-staging DIR` | keep the downloaded files for inspection |

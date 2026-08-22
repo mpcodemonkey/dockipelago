@@ -3,8 +3,9 @@
 
     python tools/dockerhub_overview.py --output overview.md
 
-Reads the crawler's lockfile and this checkout's git history; talks to nothing. Publishing the
-result is the workflow's job, so this stays runnable and testable without credentials.
+Reads the crawler's lockfile and this checkout's git history; talks to nothing. This is how to see
+what would be published - the crawler's --docker-description publishes the same text after a push,
+and needs credentials to do it, while this needs none.
 """
 
 import argparse
@@ -15,13 +16,22 @@ from pathlib import Path
 def run(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
-    from tools.custom_worlds.overview import DESCRIPTION_LIMIT, build, detect_base, read_lockfile
+    from tools.custom_worlds.overview import (
+        DESCRIPTION_LIMIT,
+        build,
+        detect_base,
+        detect_repository,
+        read_lockfile,
+    )
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=root, help="repository to describe")
     parser.add_argument("--output", type=Path, help="write here instead of standard output")
-    parser.add_argument("--image", default="ubufugu/dockipelago", help="the image being described")
-    parser.add_argument("--repository", default="mpcodemonkey/dockipelago", help="the GitHub repository")
+    parser.add_argument("--image", default="dockipelago", help="the image being described")
+    parser.add_argument("--tag", default="nightly", help="the tag being described")
+    parser.add_argument(
+        "--repository", default="", help="the GitHub repository to link (default: this checkout's origin)"
+    )
     parser.add_argument("--branch", default="main", help="branch the linked files are read from")
     parser.add_argument(
         "--upstream-ref",
@@ -44,7 +54,12 @@ def run(argv: list[str] | None = None) -> int:
         )
 
     description = build(
-        worlds, base, image=args.image, repository=args.repository, branch=args.branch
+        worlds,
+        base,
+        image=args.image,
+        tag=args.tag,
+        repository=args.repository or detect_repository(args.root),
+        branch=args.branch,
     )
     if len(description) > DESCRIPTION_LIMIT:  # build() trims, so this should be unreachable
         sys.stderr.write(

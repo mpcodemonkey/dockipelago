@@ -7,6 +7,7 @@ own, whatever it is handed.
 """
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,11 +18,13 @@ from tools.custom_worlds.overview import (
     Base,
     build,
     detect_base,
+    detect_repository,
     read_lockfile,
 )
 
 IMAGE = "ubufugu/dockipelago"
 REPOSITORY = "mpcodemonkey/dockipelago"
+FALLBACK = "somebody/somewhere"
 BASE = Base("fe5b49e1899b32bcb9f65e91cb7f74d6aa6d0ff8", "Core: limit depth of received JSON (#6378)", "2026-08-10")
 
 
@@ -59,7 +62,7 @@ class TestStayingInsideTheLimit(unittest.TestCase):
     def test_the_table_is_trimmed_rather_than_the_page_overflowing(self) -> None:
         trimmed = page(worlds(400, repaired=400), limit=8000)
         self.assertLessEqual(len(trimmed), 8000)
-        self.assertIn("more — see", trimmed, "a trimmed table has to say so")
+        self.assertIn("more, listed in", trimmed, "a trimmed table has to say so")
         self.assertLess(trimmed.count("| Game Number"), 400)
 
     def test_it_falls_back_to_a_summary_when_no_table_fits(self) -> None:
@@ -94,10 +97,27 @@ class TestWhatItSays(unittest.TestCase):
     def test_the_world_count_is_reported(self) -> None:
         self.assertIn("42 custom worlds", page(worlds(42)))
 
-    def test_the_full_list_is_linked_rather_than_included(self) -> None:
+    def test_the_full_list_is_named_rather_than_included(self) -> None:
         text = page(worlds(600))
         self.assertIn("custom_worlds.lock.json", text)
         self.assertNotIn("| Game Number 500 |", text)
+
+    def test_the_lockfile_is_not_linked_because_it_is_not_committed(self) -> None:
+        # It is written by the crawl that built the image and ignored by git, so a link to it in
+        # the repository would be a dead one on a public page.
+        for entries in (worlds(600), worlds(600, repaired=600)):
+            with self.subTest(repaired=bool(entries[0].get("repaired"))):
+                self.assertNotIn("blob/main/custom_worlds.lock.json", page(entries))
+
+    def test_the_tag_being_published_is_the_one_shown(self) -> None:
+        text = build(worlds(3), BASE, image="you/thing", tag="testing", repository=REPOSITORY)
+        self.assertIn("docker pull you/thing:testing", text)
+        self.assertIn("docker run --rm -p 80:80 you/thing:testing", text)
+
+    def test_the_source_links_point_at_the_repository_given(self) -> None:
+        text = build(worlds(3), BASE, image=IMAGE, repository="someone/their-fork")
+        self.assertIn("https://github.com/someone/their-fork", text)
+        self.assertNotIn(REPOSITORY, text)
 
     def test_repairs_are_named_in_plain_words(self) -> None:
         text = page(worlds(3, repaired=1))
@@ -148,6 +168,44 @@ class TestDetectingTheBase(unittest.TestCase):
     def test_a_directory_that_is_not_a_repository_yields_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             self.assertFalse(detect_base(Path(folder)))
+
+
+class TestDetectingTheRepository(unittest.TestCase):
+    """Whoever built the image is who the page should send a reader to."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+
+    def clone_from(self, url: str) -> str:
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(["git", "remote", "add", "origin", url], cwd=self.root, check=True)
+        return detect_repository(self.root, fallback=FALLBACK)
+
+    def test_every_way_github_spells_a_remote_is_understood(self) -> None:
+        for url in (
+            "https://github.com/someone/their-fork.git",
+            "https://github.com/someone/their-fork",
+            "git@github.com:someone/their-fork.git",
+            "ssh://git@github.com/someone/their-fork.git",
+        ):
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as folder:
+                self.root = Path(folder)
+                self.assertEqual("someone/their-fork", self.clone_from(url))
+
+    def test_a_remote_that_is_not_github_falls_back(self) -> None:
+        self.assertEqual(FALLBACK, self.clone_from("https://gitlab.com/someone/their-fork.git"))
+
+    def test_a_github_url_that_is_not_a_repository_falls_back(self) -> None:
+        self.assertEqual(FALLBACK, self.clone_from("https://github.com/someone"))
+
+    def test_no_remote_at_all_falls_back(self) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        self.assertEqual(FALLBACK, detect_repository(self.root, fallback=FALLBACK))
+
+    def test_somewhere_that_is_not_a_repository_falls_back(self) -> None:
+        self.assertEqual(FALLBACK, detect_repository(self.root, fallback=FALLBACK))
 
 
 if __name__ == "__main__":

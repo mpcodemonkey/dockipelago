@@ -261,7 +261,13 @@ class TestHappyPath(CrawlTestCase):
     def test_extraction_leaves_no_temporary_directory_behind(self) -> None:
         self.add_game("Some Game")
         self.crawl()
-        leftovers = [entry.name for entry in (self.root / "worlds").iterdir() if entry.name.startswith(".")]
+        # The staging directories extraction works in, specifically: .gitignore is written on
+        # purpose and belongs here.
+        leftovers = [
+            entry.name
+            for entry in (self.root / "worlds").iterdir()
+            if entry.name.startswith(".") and entry.name != ".gitignore"
+        ]
         self.assertEqual([], leftovers)
 
 
@@ -1407,6 +1413,51 @@ class TestValidation(CrawlTestCase):
         # A dry run installs nothing, so there is nothing for validation to take back out either.
         records = self.crawl(self.options(dry_run=True, validate=True))
         self.assertEqual(OUTCOME_RESOLVED, self.record_for(records, "Bad Game").outcome)
+
+
+class TestKeepingTheTreeClean(CrawlTestCase):
+    """Installed worlds are third-party source and must not reach git.
+
+    Upstream's CI lints and tests everything in the repository as though it were ours - flake8 and
+    mypy over every changed file, and the per-world sweeps in test/general - so several hundred
+    community worlds would break all of it. The crawler writes the ignore list itself rather than
+    leaving it to be maintained by hand.
+    """
+
+    def ignore_lines(self) -> list[str]:
+        text = (self.root / "worlds" / ".gitignore").read_text(encoding="utf-8")
+        return [line for line in text.splitlines() if line and not line.startswith("#")]
+
+    def test_installed_worlds_are_listed(self) -> None:
+        self.add_game("Some Game")
+        self.crawl()
+        self.assertIn("/mygame", self.ignore_lines())
+
+    def test_the_file_ignores_itself(self) -> None:
+        # Otherwise the crawl would leave the very file meant to keep the tree clean as a change.
+        self.add_game("Some Game")
+        self.crawl()
+        self.assertIn("/.gitignore", self.ignore_lines())
+
+    def test_it_is_rebuilt_rather_than_appended_to(self) -> None:
+        self.add_game("Some Game")
+        self.crawl()
+        stale = self.root / "worlds" / ".gitignore"
+        stale.write_text("/.gitignore\n/goneaway\n", encoding="utf-8")
+        self.crawl(self.options(refresh=True))
+        self.assertNotIn("/goneaway", self.ignore_lines())
+        self.assertIn("/mygame", self.ignore_lines())
+
+    def test_a_world_from_an_earlier_run_is_still_listed(self) -> None:
+        # A second run that reuses what is installed must not stop ignoring it.
+        self.add_game("Some Game")
+        self.crawl()
+        self.crawl()
+        self.assertIn("/mygame", self.ignore_lines())
+
+    def test_nothing_is_written_when_nothing_is_installed(self) -> None:
+        self.crawl()
+        self.assertFalse((self.root / "worlds" / ".gitignore").exists())
 
 
 class TestGenerationReport(CrawlTestCase):

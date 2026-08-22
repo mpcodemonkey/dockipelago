@@ -17,11 +17,10 @@ One directory, one tool, and the file that ties them together:
   **`custom_worlds.lock.json`** records what it installed, from which repository and release, so any
   world in `worlds/` can be traced back to a wiki page and a tag.
 
-Beyond those, this section of the README, the crawler's own documentation, and the Docker Hub steps
-added to `.github/workflows/docker.yml`, nothing diverges from upstream — no patches to
-`WebHost.py`, `settings.py`, the `Dockerfile` or any bundled world. That is deliberate: it keeps
-merging upstream changes cheap, and it means a world that misbehaves here would misbehave on stock
-Archipelago too.
+Beyond those, this section of the README and the crawler's own documentation, nothing diverges from
+upstream — no patches to `WebHost.py`, `settings.py`, the `Dockerfile`, any workflow, or any bundled
+world. That is deliberate: it keeps merging upstream changes cheap, and it means a world that
+misbehaves here would misbehave on stock Archipelago too.
 
 ## Refreshing the custom worlds
 
@@ -39,8 +38,10 @@ That walks the wiki category, resolves each game's download link to a GitHub rel
 Run it on the same Python the image uses (**3.12**) — an older interpreter cannot tell a world using
 newer syntax from a broken one, and the crawler will say so if it is running one.
 
-**The results have to be committed.** The image is built with `COPY . .`, so `worlds/` is baked in at
-build time; a crawl that is not committed changes nothing about the published image.
+**The results stay on your machine.** Nothing a crawl writes is committed — see
+[why](#why-the-worlds-are-not-committed) below. The image is built with `COPY . .`, so `worlds/` is
+baked in from the working tree: the build has to happen in the checkout that was just crawled, which
+is what `--docker-build` below is for.
 
 `--validate-generation` additionally asks every installed world for a solo seed and reports which
 cannot produce one. It removes nothing, because a single failed generation is weak evidence.
@@ -50,65 +51,52 @@ format, and every flag — is in **[docs/custom worlds crawler.md](docs/custom%2
 
 ## The Docker image
 
-The `Dockerfile` is upstream's, unmodified. It builds the WebHost and serves it with
-`python WebHost.py`, and because it copies the whole checkout it ships whatever is in `worlds/` at
-build time. So the release cycle is: crawl, commit, build.
+The `Dockerfile` and `.github/workflows/docker.yml` are upstream's, untouched. CI builds and
+publishes to the GitHub Container Registry exactly as upstream does — and that image contains **no
+custom worlds**, because they are not in the repository.
+
+The image with the worlds in it is built where the crawl happened, as the last step of a crawl:
 
 ```bash
-docker build -t dockipelago .
-docker run --rm -p 80:80 dockipelago
+export DOCKERHUB_USERNAME=you
+export DOCKERHUB_TOKEN=dckr_pat_...
+
+python tools/crawl_custom_worlds.py --repair --validate \
+    --docker-push --docker-image you/dockipelago
 ```
 
-`.github/workflows/docker.yml` builds `amd64` and `arm64` and publishes to two registries:
-
-| Trigger | GitHub Container Registry | Docker Hub |
-| --- | --- | --- |
-| push to `main` | `ghcr.io/mpcodemonkey/dockipelago:nightly` | `ubufugu/dockipelago:nightly` |
-| tag `v1.2.3` | `:1.2.3`, `:1.2`, and `:latest` | *nothing* |
-
-**Docker Hub only ever receives `nightly`.** `ubufugu/dockipelago:latest` is published by hand and no
-automated build moves it — not even a version tag. That is structural rather than a convention to
-remember: the Docker Hub tags come from their own `metadata-action` step with `flavor: latest=false`
-and a single `nightly` rule, so there is no path by which `latest` can be produced. Pull the
-automatically built image with:
+`--docker-build` stops after building, and needs no account at all — the default tag is
+`dockipelago:nightly`, which is enough to run it locally:
 
 ```bash
-docker pull ubufugu/dockipelago:nightly
+python tools/crawl_custom_worlds.py --repair --validate --docker-build
+docker run --rm -p 80:80 dockipelago:nightly
 ```
 
-Docker Hub authentication uses two repository secrets, `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
-The account they name does not have to be the one that owns the namespace above — an access token
-belonging to any account with push rights to it will do — which is why the username is a secret
-rather than a name written into the workflow.
+`--docker-tag` sets the tag, and `--docker-description` replaces the repository description on
+Docker Hub with one built from the lockfile: the Archipelago commit the image was built on, how many
+worlds it carries, and which of them the crawler had to write boilerplate for.
 
-Both are required. Where either cannot be read — a pull request from a fork — the login and the
-Docker Hub tags are skipped together, so those builds still produce their GHCR images rather than
-failing on a login they were never going to make.
+**Credentials are read from the environment only.** `DOCKERHUB_TOKEN` is deliberately not a flag —
+an argument is readable in the process list by any other user on the machine, and stays in the shell
+history of whoever ran it. The token reaches `docker login` on stdin and nowhere else. Nothing about
+any account lives in this repository.
 
-### The Docker Hub overview
+Anything that would stop a push is checked *before* the build starts: a missing credential or an
+image name without a namespace is refused up front rather than after several minutes of work.
 
-`tools/dockerhub_overview.py` writes the description shown on the Docker Hub page, and the workflow
-publishes it after the image is pushed. It names the Archipelago commit the image was built on, how
-many custom worlds came with it, and which of those worlds had boilerplate written for them by the
-crawler.
+## Why the worlds are not committed
 
-What it deliberately leaves out is the list of games. Docker Hub caps the description at 25,000
-characters, and naming every world with its version and source repository comes to roughly 62,000 at
-580 worlds, so the full list lives in the lockfile and the page links to it. The generator holds
-itself to the limit: the only section that grows without bound is the repaired table, which is
-trimmed to fit and then reduced to a one-line summary rather than ever producing a description
-Docker Hub would reject.
+They are third-party source, several hundred of it, and upstream's CI treats everything here as
+ours: `analyze-modified-files.yml` runs flake8 and mypy over every changed `.py`, and
+`unittests.yml` runs the per-world sweeps in `test/general` over every registered world. Committing
+the crawl would put thousands of files that were never written to those standards through both, and
+break the checks that make merging upstream safe.
 
-It talks to nothing, so it can be run and read at any time:
-
-```bash
-python tools/dockerhub_overview.py            # to standard output
-```
-
-The upstream commit comes from `git merge-base HEAD upstream/main`, which needs upstream's history —
-the workflow fetches it without blobs for that one step. Where it cannot be resolved the section is
-omitted rather than guessed at, since a description naming the wrong commit would be worse than one
-naming none.
+So a crawl leaves the tree clean and everyone builds their own set. The crawler writes
+`worlds/.gitignore` naming exactly what it installed — including itself, so it is not a change
+either — and rebuilds that list every run, and `custom_worlds.lock.json` is ignored too. `git status`
+after a full crawl is empty.
 
 ---
 

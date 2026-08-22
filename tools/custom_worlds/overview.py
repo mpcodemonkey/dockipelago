@@ -7,11 +7,14 @@ comes to roughly 62,000 characters at 580 worlds, so the full list cannot live h
 What goes in instead is what a reader of the Docker Hub page actually needs and cannot get anywhere
 else: which Archipelago this was built from, how many worlds came with it, and - the part that is
 genuinely particular to this image - which of those worlds had boilerplate written for them by the
-crawler rather than shipping it themselves. The exhaustive list is one link away, in the lockfile,
-which is generated anyway and never goes stale.
+crawler rather than shipping it themselves.
 
-Nothing here talks to Docker Hub. This writes Markdown to a file; publishing it is the workflow's
-job, which keeps the generator runnable and testable without credentials.
+There is nowhere to link the exhaustive list to. The lockfile that has it is written by the crawl
+that built the image and is not committed, so the page says what it knows and points at the crawler
+for the rest.
+
+Nothing here talks to Docker Hub. This writes Markdown; publishing it is somebody else's job, which
+keeps the generator runnable and testable without credentials.
 """
 
 import json
@@ -24,6 +27,9 @@ DESCRIPTION_LIMIT = 25_000
 
 #: Where the upstream project lives, for linking the commit this was built from.
 UPSTREAM = "ArchipelagoMW/Archipelago"
+
+#: Whose fork to link when the checkout cannot say which one built the image.
+DEFAULT_REPOSITORY = "mpcodemonkey/dockipelago"
 
 #: What the crawler's repair codes mean to somebody reading a Docker Hub page.
 _REPAIRS = {
@@ -73,6 +79,35 @@ def detect_base(root: Path, upstream_ref: str = "upstream/main") -> Base:
     )
 
 
+def detect_repository(root: Path, fallback: str = DEFAULT_REPOSITORY) -> str:
+    """The GitHub repository this checkout came from, for the page's source links.
+
+    Anybody can run the crawler and publish their own image, so the links should point at whichever
+    fork built it rather than at this one. If the remote is not a GitHub URL - a local clone, a
+    mirror, no remote at all - the fallback is used, since a page linking nowhere helps nobody.
+    """
+    try:
+        done = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return fallback
+    if done.returncode != 0:
+        return fallback
+
+    url = done.stdout.strip().removesuffix(".git")
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:", "ssh://git@github.com/"):
+        if url.startswith(prefix):
+            slug = url[len(prefix) :].strip("/")
+            return slug if slug.count("/") == 1 else fallback
+    return fallback
+
+
 def read_lockfile(path: Path) -> list[dict[str, object]]:
     """The installed worlds recorded by the last crawl, or an empty list if there is no lockfile."""
     if not path.is_file():
@@ -93,41 +128,33 @@ def build(
     *,
     image: str,
     repository: str,
+    tag: str = "nightly",
     branch: str = "main",
     limit: int = DESCRIPTION_LIMIT,
 ) -> str:
     """Assemble the description, trimming the repaired list if it would not fit."""
-    lockfile_url = f"https://github.com/{repository}/blob/{branch}/custom_worlds.lock.json"
     repaired = _repaired(worlds)
 
-    head = _head(worlds, base, image=image, repository=repository, branch=branch, lockfile_url=lockfile_url)
-    tail = _tail(repository, branch)
+    head = _head(worlds, base, image=image, tag=tag)
+    tail = _tail(repository, branch, image=image, tag=tag)
 
     # Only the repaired table can grow without bound, so it is the only thing that gets trimmed.
     room = limit - len(head) - len(tail)
-    body, shown = _repaired_section(repaired, room, lockfile_url)
+    body, shown = _repaired_section(repaired, room)
     page = head + body + tail
     if len(page) > limit:  # nothing left to give: drop the section rather than be rejected
-        page = head + _repaired_summary(len(repaired), shown, lockfile_url) + tail
+        page = head + _repaired_summary(len(repaired), shown) + tail
     return page
 
 
-def _head(
-    worlds: list[dict[str, object]],
-    base: Base,
-    *,
-    image: str,
-    repository: str,
-    branch: str,
-    lockfile_url: str,
-) -> str:
+def _head(worlds: list[dict[str, object]], base: Base, *, image: str, tag: str) -> str:
     lines = [
         "# dockipelago",
         "",
         "Archipelago's WebHost, with the community's custom worlds already installed.",
         "",
         "```bash",
-        f"docker pull {image}:nightly",
+        f"docker pull {image}:{tag}",
         "```",
         "",
         "## What is in this image",
@@ -144,14 +171,18 @@ def _head(
     else:
         lines.append(f"- **Archipelago**, forked from [{UPSTREAM}](https://github.com/{UPSTREAM})")
     lines += [
-        f"- **{len(worlds)} custom worlds** from the wiki's "
-        "[Custom games](https://archipelago.miraheze.org/wiki/Category:Custom_games) category, "
-        "on top of the games Archipelago ships with.",
+        (
+            f"- **{len(worlds)} custom worlds** from the wiki's "
+            "[Custom games](https://archipelago.miraheze.org/wiki/Category:Custom_games) category, "
+            "on top of the games Archipelago ships with."
+        ),
         "",
-        "Every world is checked against this Archipelago version before it is installed, so what is "
-        "here is what the WebHost will actually serve. The full list — each world with the "
-        f"repository and release tag it came from — is in [`custom_worlds.lock.json`]({lockfile_url}), "
-        "which is far too long for this page.",
+        (
+            "Every world is checked against this Archipelago version before it is installed, so what "
+            "is here is what the WebHost will actually serve. The full list — each world with the "
+            "repository and release tag it came from — is written to `custom_worlds.lock.json` by "
+            "the crawl that built this image, and is far too long for this page."
+        ),
         "",
     ]
     return "\n".join(lines) + "\n"
@@ -170,9 +201,7 @@ def _repaired(worlds: list[dict[str, object]]) -> list[tuple[str, str, str]]:
     return sorted(rows)
 
 
-def _repaired_section(
-    repaired: list[tuple[str, str, str]], room: int, lockfile_url: str
-) -> tuple[str, int]:
+def _repaired_section(repaired: list[tuple[str, str, str]], room: int) -> tuple[str, int]:
     """The repaired table, cut to whatever room is left, and how many rows it shows."""
     if not repaired:
         return "", 0
@@ -197,15 +226,15 @@ def _repaired_section(
         used += len(row)
         shown += 1
     if shown == 0:
-        return _repaired_summary(len(repaired), 0, lockfile_url), 0
+        return _repaired_summary(len(repaired), 0), 0
 
     section = intro + "".join(rows[:shown])
     if shown < len(repaired):
-        section += f"\n_and {len(repaired) - shown} more — see [the lockfile]({lockfile_url})._\n"
+        section += f"\n_and {len(repaired) - shown} more, listed in the crawl's lockfile._\n"
     return section + "\n", shown
 
 
-def _repaired_summary(total: int, shown: int, lockfile_url: str) -> str:
+def _repaired_summary(total: int, shown: int) -> str:
     """A one-liner for when even a trimmed table will not fit."""
     if not total:
         return ""
@@ -214,29 +243,33 @@ def _repaired_summary(total: int, shown: int, lockfile_url: str) -> str:
         "## Worlds this image completed\n"
         "\n"
         f"{total} worlds arrived without the boilerplate the WebHost insists on and had the missing "
-        f"part written for them. Which ones, and what was written, is recorded in "
-        f"[the lockfile]({lockfile_url}).\n"
+        "part written for them. Which ones, and what was written, is recorded in the lockfile the "
+        "crawl produced.\n"
         "\n"
     )
 
 
-def _tail(repository: str, branch: str) -> str:
+def _tail(repository: str, branch: str, *, image: str, tag: str) -> str:
     return "\n".join(
         [
             "## Running it",
             "",
             "```bash",
-            f"docker run --rm -p 80:80 {repository.rsplit('/', 1)[-1]}",
+            f"docker run --rm -p 80:80 {image}:{tag}",
             "```",
             "",
-            "Serves the WebHost on port 80. It is upstream's `Dockerfile` unmodified — only the "
-            "contents of `worlds/` differ.",
+            (
+                "Serves the WebHost on port 80. It is upstream's `Dockerfile` unmodified — only the "
+                "contents of `worlds/` differ."
+            ),
             "",
             "## Documentation",
             "",
             f"- [Source and README](https://github.com/{repository})",
-            f"- [How the worlds get here](https://github.com/{repository}/blob/{branch}/docs/"
-            "custom%20worlds%20crawler.md)",
+            (
+                f"- [How the worlds get here](https://github.com/{repository}/blob/{branch}/docs/"
+                "custom%20worlds%20crawler.md)"
+            ),
             f"- [Archipelago itself](https://github.com/{UPSTREAM})",
             "",
         ]
