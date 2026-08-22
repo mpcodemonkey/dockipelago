@@ -62,7 +62,7 @@ class TestStayingInsideTheLimit(unittest.TestCase):
     def test_the_table_is_trimmed_rather_than_the_page_overflowing(self) -> None:
         trimmed = page(worlds(400, repaired=400), limit=8000)
         self.assertLessEqual(len(trimmed), 8000)
-        self.assertIn("more, listed in", trimmed, "a trimmed table has to say so")
+        self.assertIn("more — see", trimmed, "a trimmed table has to say so")
         self.assertLess(trimmed.count("| Game Number"), 400)
 
     def test_it_falls_back_to_a_summary_when_no_table_fits(self) -> None:
@@ -97,17 +97,10 @@ class TestWhatItSays(unittest.TestCase):
     def test_the_world_count_is_reported(self) -> None:
         self.assertIn("42 custom worlds", page(worlds(42)))
 
-    def test_the_full_list_is_named_rather_than_included(self) -> None:
+    def test_the_full_list_is_linked_rather_than_included(self) -> None:
         text = page(worlds(600))
-        self.assertIn("custom_worlds.lock.json", text)
+        self.assertIn(f"https://github.com/{REPOSITORY}/blob/main/custom_worlds.lock.json", text)
         self.assertNotIn("| Game Number 500 |", text)
-
-    def test_the_lockfile_is_not_linked_because_it_is_not_committed(self) -> None:
-        # It is written by the crawl that built the image and ignored by git, so a link to it in
-        # the repository would be a dead one on a public page.
-        for entries in (worlds(600), worlds(600, repaired=600)):
-            with self.subTest(repaired=bool(entries[0].get("repaired"))):
-                self.assertNotIn("blob/main/custom_worlds.lock.json", page(entries))
 
     def test_the_tag_being_published_is_the_one_shown(self) -> None:
         text = build(worlds(3), BASE, image="you/thing", tag="testing", repository=REPOSITORY)

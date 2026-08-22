@@ -639,14 +639,13 @@ for a per-page JSON report including the games that failed and why.
 pages they did not visit keep their existing entries in both lists, and `--prune` leaves those worlds
 alone. Only a full crawl treats a page's absence from the run as its absence from the wiki.
 
-## The tree stays clean
+## The worlds are not committed
 
-Nothing a crawl writes is committed. The installed worlds are third-party source, several hundred of
-them, and upstream's CI treats everything in the repository as ours: `analyze-modified-files.yml`
-runs flake8 and mypy over every changed `.py`, and `unittests.yml` runs the per-world sweeps in
-`test/general` over every registered world. Committing a crawl puts thousands of files that were
-never written to those standards through both, and breaks the checks that make merging upstream
-safe.
+The installed worlds are third-party source, several hundred of them, and upstream's CI treats
+everything in the repository as ours: `analyze-modified-files.yml` runs flake8 and mypy over every
+changed `.py`, and `unittests.yml` runs the per-world sweeps in `test/general` over every registered
+world. Committing a crawl puts thousands of files that were never written to those standards through
+both, and breaks the checks that make merging upstream safe.
 
 So each run writes `worlds/.gitignore` naming exactly what it installed:
 
@@ -664,11 +663,15 @@ So each run writes `worlds/.gitignore` naming exactly what it installed:
 
 The file names itself first, so it is not a change either. The list is rebuilt each run from the
 lockfile plus what this run installed, rather than appended to, so a world that is removed drops out
-of it. `custom_worlds.lock.json` is ignored by the repository's own `.gitignore`. `git status` after
-a full crawl is empty.
+of it.
 
-Which means the image cannot be built from a checkout by itself — the worlds only exist where the
-crawl ran.
+The lockfile is the exception: `custom_worlds.lock.json` is committed, because it is the crawler's
+own output rather than somebody else's source, and none of upstream's checks look at it. A crawl
+therefore shows up in `git status` as exactly one changed file, whose diff says which world moved to
+which release.
+
+All of which means the image cannot be built from a checkout by itself — the worlds only exist where
+the crawl ran.
 
 ## Building the image
 

@@ -7,11 +7,9 @@ comes to roughly 62,000 characters at 580 worlds, so the full list cannot live h
 What goes in instead is what a reader of the Docker Hub page actually needs and cannot get anywhere
 else: which Archipelago this was built from, how many worlds came with it, and - the part that is
 genuinely particular to this image - which of those worlds had boilerplate written for them by the
-crawler rather than shipping it themselves.
-
-There is nowhere to link the exhaustive list to. The lockfile that has it is written by the crawl
-that built the image and is not committed, so the page says what it knows and points at the crawler
-for the rest.
+crawler rather than shipping it themselves. The exhaustive list is one link away, in the lockfile,
+which is committed and never goes stale - unlike the worlds themselves, it is our own generated
+manifest rather than third-party source, so it costs nothing to keep in git.
 
 Nothing here talks to Docker Hub. This writes Markdown; publishing it is somebody else's job, which
 keeps the generator runnable and testable without credentials.
@@ -133,21 +131,24 @@ def build(
     limit: int = DESCRIPTION_LIMIT,
 ) -> str:
     """Assemble the description, trimming the repaired list if it would not fit."""
+    lockfile_url = f"https://github.com/{repository}/blob/{branch}/custom_worlds.lock.json"
     repaired = _repaired(worlds)
 
-    head = _head(worlds, base, image=image, tag=tag)
+    head = _head(worlds, base, image=image, tag=tag, lockfile_url=lockfile_url)
     tail = _tail(repository, branch, image=image, tag=tag)
 
     # Only the repaired table can grow without bound, so it is the only thing that gets trimmed.
     room = limit - len(head) - len(tail)
-    body, shown = _repaired_section(repaired, room)
+    body, shown = _repaired_section(repaired, room, lockfile_url)
     page = head + body + tail
     if len(page) > limit:  # nothing left to give: drop the section rather than be rejected
-        page = head + _repaired_summary(len(repaired), shown) + tail
+        page = head + _repaired_summary(len(repaired), shown, lockfile_url) + tail
     return page
 
 
-def _head(worlds: list[dict[str, object]], base: Base, *, image: str, tag: str) -> str:
+def _head(
+    worlds: list[dict[str, object]], base: Base, *, image: str, tag: str, lockfile_url: str
+) -> str:
     lines = [
         "# dockipelago",
         "",
@@ -180,8 +181,8 @@ def _head(worlds: list[dict[str, object]], base: Base, *, image: str, tag: str) 
         (
             "Every world is checked against this Archipelago version before it is installed, so what "
             "is here is what the WebHost will actually serve. The full list — each world with the "
-            "repository and release tag it came from — is written to `custom_worlds.lock.json` by "
-            "the crawl that built this image, and is far too long for this page."
+            f"repository and release tag it came from — is in "
+            f"[`custom_worlds.lock.json`]({lockfile_url}), which is far too long for this page."
         ),
         "",
     ]
@@ -201,7 +202,9 @@ def _repaired(worlds: list[dict[str, object]]) -> list[tuple[str, str, str]]:
     return sorted(rows)
 
 
-def _repaired_section(repaired: list[tuple[str, str, str]], room: int) -> tuple[str, int]:
+def _repaired_section(
+    repaired: list[tuple[str, str, str]], room: int, lockfile_url: str
+) -> tuple[str, int]:
     """The repaired table, cut to whatever room is left, and how many rows it shows."""
     if not repaired:
         return "", 0
@@ -226,15 +229,15 @@ def _repaired_section(repaired: list[tuple[str, str, str]], room: int) -> tuple[
         used += len(row)
         shown += 1
     if shown == 0:
-        return _repaired_summary(len(repaired), 0), 0
+        return _repaired_summary(len(repaired), 0, lockfile_url), 0
 
     section = intro + "".join(rows[:shown])
     if shown < len(repaired):
-        section += f"\n_and {len(repaired) - shown} more, listed in the crawl's lockfile._\n"
+        section += f"\n_and {len(repaired) - shown} more — see [the lockfile]({lockfile_url})._\n"
     return section + "\n", shown
 
 
-def _repaired_summary(total: int, shown: int) -> str:
+def _repaired_summary(total: int, shown: int, lockfile_url: str) -> str:
     """A one-liner for when even a trimmed table will not fit."""
     if not total:
         return ""
@@ -243,8 +246,8 @@ def _repaired_summary(total: int, shown: int) -> str:
         "## Worlds this image completed\n"
         "\n"
         f"{total} worlds arrived without the boilerplate the WebHost insists on and had the missing "
-        "part written for them. Which ones, and what was written, is recorded in the lockfile the "
-        "crawl produced.\n"
+        f"part written for them. Which ones, and what was written, is recorded in "
+        f"[the lockfile]({lockfile_url}).\n"
         "\n"
     )
 

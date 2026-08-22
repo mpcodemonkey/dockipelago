@@ -38,10 +38,10 @@ That walks the wiki category, resolves each game's download link to a GitHub rel
 Run it on the same Python the image uses (**3.12**) — an older interpreter cannot tell a world using
 newer syntax from a broken one, and the crawler will say so if it is running one.
 
-**The results stay on your machine.** Nothing a crawl writes is committed — see
-[why](#why-the-worlds-are-not-committed) below. The image is built with `COPY . .`, so `worlds/` is
-baked in from the working tree: the build has to happen in the checkout that was just crawled, which
-is what `--docker-build` below is for.
+**The worlds themselves stay on your machine** — only `custom_worlds.lock.json`, the record of what
+was installed, is committed; see [why](#why-the-worlds-are-not-committed) below. The image is built
+with `COPY . .`, so `worlds/` is baked in from the working tree: the build has to happen in the
+checkout that was just crawled, which is what `--docker-build` below is for.
 
 `--validate-generation` additionally asks every installed world for a solo seed and reports which
 cannot produce one. It removes nothing, because a single failed generation is weak evidence.
@@ -93,10 +93,13 @@ ours: `analyze-modified-files.yml` runs flake8 and mypy over every changed `.py`
 the crawl would put thousands of files that were never written to those standards through both, and
 break the checks that make merging upstream safe.
 
-So a crawl leaves the tree clean and everyone builds their own set. The crawler writes
+So a crawl leaves the worlds out of git and everyone builds their own set. The crawler writes
 `worlds/.gitignore` naming exactly what it installed — including itself, so it is not a change
-either — and rebuilds that list every run, and `custom_worlds.lock.json` is ignored too. `git status`
-after a full crawl is empty.
+either — and rebuilds that list every run.
+
+`custom_worlds.lock.json` *is* committed. It is our own generated manifest rather than third-party
+source, so nothing upstream's CI does touches it, and having it in git is what lets a review see
+which world moved to which release between one crawl and the next.
 
 ---
 
